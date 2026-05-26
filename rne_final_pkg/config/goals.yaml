@@ -1,0 +1,12 @@
+# Fill these in after SLAM + Foxglove /amcl_pose inspection
+task1_search_waypoints:
+  - [1.0, 1.0]
+  - [2.0, 1.0]
+  - [2.0, 2.0]
+
+task2_bridge_approach: [2.0, 3.5]
+task2_bridge_exit:     [2.0, 6.5]
+
+task3_search_waypoints:
+  - [4.0, 1.0]
+  - [5.0, 2.0]
