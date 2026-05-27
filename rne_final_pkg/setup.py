@@ -20,6 +20,7 @@ setup(
             'final_mission = rne_final_pkg.final_mission:main',
             'topic_check   = rne_final_pkg.topic_check:main',
             'yolo_align    = rne_final_pkg.yolo_align:main',
+            'get_bear      = rne_final_pkg.get_bear_node:main',
         ],
     },
 )

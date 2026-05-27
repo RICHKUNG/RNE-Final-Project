@@ -1,0 +1,34 @@
+# Distance (meters) from bear where Nav2 goal is placed.
+# Robot will navigate to this point, then visual-servo the rest of the way.
+bear_stop_distance_m: 1.0
+
+# How long to spin searching for a bear before giving up (seconds).
+search_rotation_timeout: 30.0
+
+# Nav2 arrival threshold (meters).
+nav_arrive_threshold: 0.5
+
+# Minimum distance (meters) to the next plan waypoint before advancing the index.
+plan_follow_min_dist: 0.5
+
+# Heading error below which the robot drives forward instead of rotating (degrees).
+plan_forward_angle_deg: 20.0
+
+# Pixel offset from center that triggers a rotation command during visual servo.
+visual_servo_rotate_threshold_px: 50.0
+
+# Depth (meters) at which visual servo stops and grab begins.
+grab_distance_threshold: 0.5
+
+# TF frame of the depth camera (Z-axis forward / optical convention).
+camera_frame: "camera_optical_frame"
+
+# Seconds after startup to wait for /amcl_pose before publishing /initialpose.
+# If AMCL is already localized, the publish is skipped automatically.
+initial_pose_timeout: 3.0
+
+# Starting pose published to /initialpose if AMCL has no estimate yet (map frame).
+# Set these to match the robot's actual spawn position in Unity.
+initial_pose_x: 0.0
+initial_pose_y: 0.0
+initial_pose_yaw: 0.0
