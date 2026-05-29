@@ -1,9 +1,16 @@
 # Distance (meters) from bear where Nav2 goal is placed.
-# Robot will navigate to this point, then visual-servo the rest of the way.
+# Robot navigates here, then switches to visual servo for the final approach.
 bear_stop_distance_m: 1.0
 
 # How long to spin searching for a bear before giving up (seconds).
 search_rotation_timeout: 30.0
+
+# SEARCH_SPIN: seconds of spinning per phase before nudging forward.
+# Keeps the robot from staying pinned against a wall indefinitely.
+search_spin_phase_seconds: 8.0
+
+# SEARCH_SPIN: seconds to drive forward between spin phases.
+search_nudge_seconds: 1.5
 
 # Nav2 arrival threshold (meters).
 nav_arrive_threshold: 0.5
@@ -35,3 +42,73 @@ initial_pose_timeout: 3.0
 initial_pose_x: 0.0
 initial_pose_y: 0.0
 initial_pose_yaw: 0.0
+
+# ─── Multi-bear mission policy ───────────────────────────────────────────────
+
+# Total number of bears to collect before stopping.
+# When delivered_count reaches this value the mission ends (DONE).
+# If search times out and delivered_count < total_bear_count, the robot
+# switches to EXPLORE instead of stopping.
+total_bear_count: 5
+
+# EXPLORE: seconds to drive forward when relocating after a failed search.
+explore_forward_seconds: 3.0
+
+# EXPLORE: seconds to rotate after the forward drive (changes heading for next search).
+explore_rotate_seconds: 2.0
+
+# Home position in map frame — where bears are delivered.
+# Set to match the robot's spawn / return point in Unity.
+home_x: 0.0
+home_y: 0.0
+
+# Ignore any bear visible while robot is within this radius of home (meters).
+# Prevents re-grabbing bears that were just delivered.
+home_ignore_radius: 0.8
+
+# Seconds after dropping a bear during which all bears near home are ignored.
+# Gives the bear time to settle and the robot time to back away.
+ignore_home_seconds: 5.0
+
+# Seconds to wait after publishing /clicked_point for arm_controller_2D to
+# finish its background grab sequence (open → reach → close → retract).
+# Increase if the arm sequence seems to be cut off early.
+grab_wait_seconds: 10.0
+
+# VERIFY_GRASP: seconds to drive backward before observing.
+verify_backup_seconds: 0.5
+
+# VERIFY_GRASP: seconds to count YOLO bear frames after backing up.
+verify_duration_seconds: 2.0
+
+# VERIFY_GRASP: depth threshold (meters) below which a detected bear is
+# considered to be on the arm rather than on the ground.
+# Arm length is ~0.19 m; use a value slightly above the max arm reach.
+verify_arm_depth_threshold: 0.35
+
+# VERIFY_GRASP: minimum frames where bear depth < threshold to confirm grasp.
+# At 10 Hz over 2 s = 20 frames; 3 is a lenient minimum.
+verify_close_min_frames: 3
+
+# Maximum grab retries before giving up on this bear and searching for another.
+grab_retry_max: 2
+
+# Seconds to wait after opening gripper for the FixedJoint to detach in Unity.
+drop_wait_seconds: 2.0
+
+# Seconds to drive backward after dropping (to leave the drop zone).
+back_away_backward_seconds: 1.5
+
+# Seconds to rotate after backing away from home (to face away before re-searching).
+back_away_rotate_seconds: 1.0
+
+# ─── Stuck detection ─────────────────────────────────────────────────────────
+
+# How often to sample position for stuck detection (seconds).
+stuck_check_interval: 0.5
+
+# Minimum movement (meters) per sample interval to not be considered stuck.
+stuck_move_threshold: 0.03
+
+# How long the robot must be stuck before triggering a recovery maneuver (seconds).
+stuck_timeout: 2.0
