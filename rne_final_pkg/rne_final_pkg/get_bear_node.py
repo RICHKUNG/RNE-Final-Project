@@ -18,7 +18,6 @@ import rclpy
 import rclpy.duration
 import rclpy.time
 from rclpy.node import Node
-from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 import tf2_ros
 import tf2_geometry_msgs
@@ -26,7 +25,6 @@ from geometry_msgs.msg import PointStamped, PoseWithCovarianceStamped
 from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import Float32MultiArray
 from trajectory_msgs.msg import JointTrajectoryPoint
-from action_interface.action import ArmGoal
 from ament_index_python.packages import get_package_share_directory
 import yaml
 
@@ -76,11 +74,12 @@ class GetBearNode(Node):
         self._stow_attempts = 0
         self._stow_timer = self.create_timer(0.5, self._stow_arm_once)
 
-        # Arm action client — sends catch2 goal to arm_action_server
-        self._arm_action_client = ActionClient(self, ArmGoal, "arm_action_server")
+        # /clicked_point publisher — tells arm_controller_2D where the bear is AND triggers grab
+        self._clicked_point_pub = self.create_publisher(PointStamped, "/clicked_point", 10)
 
         self._state = "SEARCH_SPIN"
         self._state_start = None
+        self._nav_plan_wait_start = None   # for NAV_TO_BEAR plan timeout
         self._bear_map_pos = None   # (x, y) in map frame
         self._grab_goal_sent = False
 
@@ -144,11 +143,10 @@ class GetBearNode(Node):
                 self.get_logger().warn("[STOW] arm_writer never subscribed — skipping stow")
                 self.destroy_timer(self._stow_timer)
             return
-        # joints_reset from arm_config.yaml — matches Manual Arm Control 'b' key
-        angles_deg = [90.0, 30.0, 160.0, 180.0, 70.0]
+        # arm_controller_2D init pose: joint0=180°, joint1=0°, joint2=90° (with dir applied)
         msg = JointTrajectoryPoint()
-        msg.positions = [math.radians(a) for a in angles_deg]
-        msg.velocities = []       # must be empty — matches arm_commute_node format
+        msg.positions = [math.pi, 0.0, math.pi / 2]
+        msg.velocities = [0.0, 0.0, 0.0]   # matches arm_controller_2D format
         msg.accelerations = []
         msg.effort = []
         self._arm_pub.publish(msg)
@@ -201,6 +199,7 @@ class GetBearNode(Node):
         self.get_logger().info(f"State: {self._state} → {state}")
         self._state = state
         self._state_start = None
+        self._nav_plan_wait_start = None
 
     def _tick(self):
         s = self._state
@@ -318,9 +317,13 @@ class GetBearNode(Node):
         dist_to_bear = math.hypot(dx, dy)
         stop_dist = self.params["bear_stop_distance_m"]
 
-        if dist_to_bear <= stop_dist:
+        arrive_th = self.params["nav_arrive_threshold"]
+        travel_dist = dist_to_bear - stop_dist
+
+        if travel_dist <= arrive_th:
+            # Too close to bother with Nav2 (short goals produce empty plans)
             self.get_logger().info(
-                f"[LOCALIZE] Already {dist_to_bear:.2f}m from bear — skipping Nav2"
+                f"[LOCALIZE] travel_dist={travel_dist:.2f}m ≤ arrive_th={arrive_th:.2f}m — skipping Nav2"
             )
             self._goto("VISUAL_SERVO")
             return
@@ -328,7 +331,7 @@ class GetBearNode(Node):
         goal_x = bear_x - (dx / dist_to_bear) * stop_dist
         goal_y = bear_y - (dy / dist_to_bear) * stop_dist
         self.get_logger().info(
-            f"[LOCALIZE] Nav2 goal ({goal_x:.2f}, {goal_y:.2f})  stop_dist={stop_dist:.1f}m"
+            f"[LOCALIZE] Nav2 goal ({goal_x:.2f}, {goal_y:.2f})  travel={travel_dist:.2f}m"
         )
         self.nav.send_goal(goal_x, goal_y)
         self._goto("NAV_TO_BEAR")
@@ -339,9 +342,24 @@ class GetBearNode(Node):
 
     def _state_nav_to_bear(self):
         if not self.nav.has_plan or self.nav.position is None:
-            self.get_logger().info("[NAV] Waiting for plan…")
+            # Start the wait timer on first entry
+            if self._nav_plan_wait_start is None:
+                self._nav_plan_wait_start = time.time()
+            waited = time.time() - self._nav_plan_wait_start
+            timeout = self.params.get("nav_plan_timeout_s", 5.0)
+            self.get_logger().info(f"[NAV] Waiting for plan… ({waited:.1f}/{timeout:.0f}s)")
             self.car.stop()
+            if waited > timeout:
+                self._nav_plan_wait_start = None
+                if self._bear_visible():
+                    self.get_logger().warn("[NAV] Plan timeout — bear visible, going to VISUAL_SERVO")
+                    self._goto("VISUAL_SERVO")
+                else:
+                    self.get_logger().warn("[NAV] Plan timeout — bear lost, returning to SEARCH_SPIN")
+                    self._goto("SEARCH_SPIN")
             return
+
+        self._nav_plan_wait_start = None  # reset once plan arrives
 
         if self.nav.arrived(self.params["nav_arrive_threshold"]):
             self.get_logger().info(
@@ -418,43 +436,36 @@ class GetBearNode(Node):
             self.car.publish("FORWARD_SLOW")
 
     # ------------------------------------------------------------------
-    # GRAB — send catch2 action goal to arm_action_server
+    # GRAB — delegate to arm_controller_2D via /clicked_point + /arm_auto_grab
     # ------------------------------------------------------------------
 
     def _state_grab(self):
         if self._grab_goal_sent:
-            return  # waiting for result callback
+            return  # one-shot: already triggered, arm_controller_2D handles the rest
 
         self.car.stop()
         self._grab_goal_sent = True
 
-        if not self._arm_action_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().warn(
-                "[GRAB] arm_action_server not available — is arm_control_pkg running? Skipping."
-            )
+        if self._bear_map_pos is None:
+            self.get_logger().warn("[GRAB] No bear map position — going to DONE")
             self._goto("DONE")
             return
 
-        goal = ArmGoal.Goal()
-        goal.mode = "catch2"
-        self.get_logger().info("[GRAB] Sending catch2 action goal to arm_action_server")
-        send_future = self._arm_action_client.send_goal_async(goal)
-        send_future.add_done_callback(self._grab_goal_response_cb)
-
-    def _grab_goal_response_cb(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn("[GRAB] catch2 goal rejected by arm_action_server")
-            self._goto("DONE")
-            return
-        self.get_logger().info("[GRAB] catch2 accepted — arm executing grab sequence")
-        goal_handle.get_result_async().add_done_callback(self._grab_result_cb)
-
-    def _grab_result_cb(self, future):
-        result = future.result().result
+        # Publish bear world position to /clicked_point so arm_controller_2D knows the target
+        bear_x, bear_y = self._bear_map_pos
+        pt = PointStamped()
+        pt.header.frame_id = "map"
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.point.x = float(bear_x)
+        pt.point.y = float(bear_y)
+        pt.point.z = 0.0
+        self._clicked_point_pub.publish(pt)
         self.get_logger().info(
-            f"[GRAB] catch2 complete  success={result.success}  msg={result.message}"
+            f"[GRAB] Published /clicked_point  map=({bear_x:.2f}, {bear_y:.2f})"
         )
+
+        # ros_communicator.clicked_point_callback sets latest_yolo_marker AND calls on_clicked_point_grab
+        self.get_logger().info("[GRAB] /clicked_point sent — arm_controller_2D will execute grab")
         self._goto("DONE")
 
 

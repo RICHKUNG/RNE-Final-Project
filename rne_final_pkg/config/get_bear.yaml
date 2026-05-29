@@ -8,6 +8,9 @@ search_rotation_timeout: 30.0
 # Nav2 arrival threshold (meters).
 nav_arrive_threshold: 0.5
 
+# Seconds to wait for Nav2 plan before falling back to VISUAL_SERVO / SEARCH_SPIN.
+nav_plan_timeout_s: 5.0
+
 # Minimum distance (meters) to the next plan waypoint before advancing the index.
 plan_follow_min_dist: 0.5
 
@@ -18,7 +21,7 @@ plan_forward_angle_deg: 20.0
 visual_servo_rotate_threshold_px: 50.0
 
 # Depth (meters) at which visual servo stops and grab begins.
-grab_distance_threshold: 0.5
+grab_distance_threshold: 0.4
 
 # TF frame of the depth camera (Z-axis forward / optical convention).
 camera_frame: "camera_optical_frame"
