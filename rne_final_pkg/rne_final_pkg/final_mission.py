@@ -44,6 +44,8 @@ class S(Enum):
     T3_UNLOCK = auto()
     T3_CLEAR  = auto()
 
+    BRIDGE_AVOID = auto()
+
     DONE = auto()
 
 
@@ -68,6 +70,8 @@ class FinalMission(Node):
 
         self._no_plan_since  = None
         self._recovery_until = 0.0
+        self._avoid_return   = S.IDLE   # state to resume after BRIDGE_AVOID
+        self._avoid_dx       = 0.0      # bridge delta_x captured at avoidance start
 
         # 10 Hz control loop
         self.create_timer(0.1, self._tick)
@@ -153,6 +157,9 @@ class FinalMission(Node):
             self._state_grab(S.T3_CLEAR)
         elif s == S.T3_CLEAR:
             self._state_clear(S.DONE)
+
+        elif s == S.BRIDGE_AVOID:
+            self._state_bridge_avoid()
 
         elif s == S.DONE:
             self.car.stop()
@@ -322,6 +329,19 @@ class FinalMission(Node):
     # ------------------------------------------------------------------
 
     def _state_approach(self, next_state):
+        # Bridge safety: if seg detects a bridge ahead, divert before continuing
+        bridge_area = self.params.get("bridge_safety_area_threshold", 0.05)
+        if self.yolo.bridge_visible() and self.yolo.bridge_area_ratio() > bridge_area:
+            self.get_logger().warn(
+                f"[APPROACH] Bridge ahead  area={self.yolo.bridge_area_ratio():.3f}  "
+                f"dx={self.yolo.bridge_delta_x():.0f}px → BRIDGE_AVOID"
+            )
+            self._avoid_return = self._state
+            self._avoid_dx = self.yolo.bridge_delta_x()
+            self.car.stop()
+            self._goto(S.BRIDGE_AVOID)
+            return
+
         if not self.yolo.is_visible():
             self.get_logger().info("[APPROACH] no target → CLOCKWISE_ROTATION_SLOW")
             self.car.publish("CLOCKWISE_ROTATION_SLOW")
@@ -408,6 +428,34 @@ class FinalMission(Node):
         except Exception as e:
             self.get_logger().warn(f"TF grab failed: {e}; using default.")
             return default
+
+    # ------------------------------------------------------------------
+    # Bridge avoidance — back up then turn away, then resume saved state
+    # ------------------------------------------------------------------
+
+    def _state_bridge_avoid(self):
+        if self._state_start is None:
+            self._state_start = time.time()
+            self.get_logger().warn(
+                f"[BRIDGE_AVOID] Backing up then turning away  dx={self._avoid_dx:.0f}px  "
+                f"will return to {self._avoid_return.name}"
+            )
+
+        elapsed = time.time() - self._state_start
+        back_t  = self.params.get("bridge_avoid_backward_seconds", 0.5)
+        turn_t  = self.params.get("bridge_avoid_turn_seconds", 0.8)
+
+        if elapsed < back_t:
+            self.car.publish("BACKWARD_SLOW")
+        elif elapsed < back_t + turn_t:
+            # bridge right of center → turn left; bridge left → turn right
+            if self._avoid_dx >= 0:
+                self.car.publish("COUNTERCLOCKWISE_ROTATION_SLOW")
+            else:
+                self.car.publish("CLOCKWISE_ROTATION_SLOW")
+        else:
+            self.get_logger().info(f"[BRIDGE_AVOID] Done → {self._avoid_return.name}")
+            self._goto(self._avoid_return)
 
     # ------------------------------------------------------------------
     # Bridge crossing (Task 2)

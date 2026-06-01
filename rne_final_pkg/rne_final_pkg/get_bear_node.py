@@ -43,7 +43,7 @@ from rne_final_pkg.nav_client import NavClient
 _LINEAR_ACTIONS = frozenset({"FORWARD", "FORWARD_SLOW", "BACKWARD", "BACKWARD_SLOW"})
 
 # States where stuck detection must not run (already recovering, or car is stopped by design).
-_NO_STUCK_CHECK = frozenset({"RECOVERY", "DONE", "GRAB", "GRAB_WAIT", "DROP", "LOCALIZE"})
+_NO_STUCK_CHECK = frozenset({"RECOVERY", "BRIDGE_AVOID", "DONE", "GRAB", "GRAB_WAIT", "DROP", "LOCALIZE"})
 
 
 class GetBearNode(Node):
@@ -62,6 +62,13 @@ class GetBearNode(Node):
         self._bear_info = None
         self.create_subscription(
             Float32MultiArray, "/yolo/bear_info", self._bear_cb, 10
+        )
+
+        # Bridge safety: [found, delta_x, area_ratio] — published periodically by yolo_node
+        self._bridge_info = None
+        self._bridge_avoid_dx = 0.0
+        self.create_subscription(
+            Float32MultiArray, "/yolo/bridge_info", self._bridge_cb, 10
         )
 
         # Camera intrinsics — publisher uses TRANSIENT_LOCAL so we must match
@@ -190,6 +197,18 @@ class GetBearNode(Node):
     def _bear_cb(self, msg):
         self._bear_info = list(msg.data)
 
+    def _bridge_cb(self, msg):
+        self._bridge_info = list(msg.data)
+
+    def _bridge_danger(self):
+        """Return True when a bridge is close enough to warrant avoidance."""
+        if not self._bridge_info or len(self._bridge_info) < 3:
+            return False
+        return (
+            self._bridge_info[0] == 1.0
+            and self._bridge_info[2] > self.params.get("bridge_safety_area_threshold", 0.05)
+        )
+
     def _camera_info_cb(self, msg):
         self._camera_info = msg
 
@@ -300,6 +319,8 @@ class GetBearNode(Node):
             self._state_back_away()
         elif s == "EXPLORE":
             self._state_explore()
+        elif s == "BRIDGE_AVOID":
+            self._state_bridge_avoid()
         elif s == "RECOVERY":
             self._state_recovery()
         elif s == "DONE":
@@ -495,6 +516,18 @@ class GetBearNode(Node):
     # ------------------------------------------------------------------
 
     def _state_visual_servo(self):
+        # Bridge safety: if bridge detected in front, divert before continuing approach
+        if self._bridge_danger():
+            area = self._bridge_info[2]
+            dx   = self._bridge_info[1]
+            self.get_logger().warn(
+                f"[VISUAL_SERVO] Bridge ahead  area={area:.3f}  dx={dx:.0f}px → BRIDGE_AVOID"
+            )
+            self._bridge_avoid_dx = dx
+            self._stop()
+            self._goto("BRIDGE_AVOID")
+            return
+
         if not self._bear_visible():
             self.get_logger().info(
                 "[VISUAL_SERVO] Bear not visible → CLOCKWISE_ROTATION_SLOW"
@@ -747,6 +780,33 @@ class GetBearNode(Node):
         else:
             self.get_logger().info("[EXPLORE] Done — retrying SEARCH_SPIN")
             self._goto("SEARCH_SPIN")
+
+    # ------------------------------------------------------------------
+    # BRIDGE_AVOID — back up then turn away from detected bridge
+    # ------------------------------------------------------------------
+
+    def _state_bridge_avoid(self):
+        if self._state_start is None:
+            self._state_start = time.time()
+            self.get_logger().warn(
+                f"[BRIDGE_AVOID] Backing up then turning away from bridge  dx={self._bridge_avoid_dx:.0f}px"
+            )
+
+        elapsed = time.time() - self._state_start
+        back_t  = self.params.get("bridge_avoid_backward_seconds", 0.5)
+        turn_t  = self.params.get("bridge_avoid_turn_seconds", 0.8)
+
+        if elapsed < back_t:
+            self._drive("BACKWARD_SLOW")
+        elif elapsed < back_t + turn_t:
+            # bridge right of center → turn left; bridge left → turn right
+            if self._bridge_avoid_dx >= 0:
+                self._drive("COUNTERCLOCKWISE_ROTATION_SLOW")
+            else:
+                self._drive("CLOCKWISE_ROTATION_SLOW")
+        else:
+            self.get_logger().info("[BRIDGE_AVOID] Done → VISUAL_SERVO")
+            self._goto("VISUAL_SERVO")
 
     # ------------------------------------------------------------------
     # RECOVERY — tiered stuck recovery, returns to saved state when done

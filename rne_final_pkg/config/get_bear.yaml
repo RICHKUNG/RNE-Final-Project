@@ -49,7 +49,7 @@ initial_pose_yaw: 0.0
 # When delivered_count reaches this value the mission ends (DONE).
 # If search times out and delivered_count < total_bear_count, the robot
 # switches to EXPLORE instead of stopping.
-total_bear_count: 5
+total_bear_count: 6
 
 # EXPLORE: seconds to drive forward when relocating after a failed search.
 explore_forward_seconds: 3.0
@@ -101,6 +101,18 @@ back_away_backward_seconds: 1.5
 
 # Seconds to rotate after backing away from home (to face away before re-searching).
 back_away_rotate_seconds: 1.0
+
+# ─── Bridge avoidance (vision safety layer) ──────────────────────────────────
+
+# VISUAL_SERVO: bridge mask area / bottom-half image area above which avoidance triggers.
+# Requires yolo_node running with segmentation.pt (SEG_CHECK_INTERVAL > 0).
+bridge_safety_area_threshold: 0.05
+
+# BRIDGE_AVOID: seconds to drive backward at the start of the avoidance maneuver.
+bridge_avoid_backward_seconds: 0.5
+
+# BRIDGE_AVOID: seconds to rotate away from the bridge after backing up.
+bridge_avoid_turn_seconds: 0.8
 
 # ─── Stuck detection ─────────────────────────────────────────────────────────
 

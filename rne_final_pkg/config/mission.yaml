@@ -13,6 +13,12 @@ bridge_deadband_px: 100.0
 bridge_min_area_ratio: 0.03
 bridge_cross_seconds: 6.0
 
+# Vision safety layer — bridge avoidance during _state_approach
+# (does NOT apply to T2_BRIDGE_ALIGN / T2_CROSS which cross deliberately)
+bridge_safety_area_threshold: 0.05
+bridge_avoid_backward_seconds: 0.5
+bridge_avoid_turn_seconds: 0.8
+
 clear_backward_seconds: 2.0
 clear_rotate_seconds: 1.0
 clear_forward_seconds: 1.0
