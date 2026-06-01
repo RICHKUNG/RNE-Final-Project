@@ -21,6 +21,8 @@ setup(
             'topic_check   = rne_final_pkg.topic_check:main',
             'yolo_align    = rne_final_pkg.yolo_align:main',
             'get_bear      = rne_final_pkg.get_bear_node:main',
+            'build_map     = rne_final_pkg.final_mapping_manager:main',
+            'rect_map      = rne_final_pkg.rectangle_mapping:main',
         ],
     },
 )
