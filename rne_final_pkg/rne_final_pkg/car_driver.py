@@ -38,5 +38,15 @@ class CarDriver:
         self._pub_rear.publish(rear_msg)
         self._pub_front.publish(front_msg)
 
+    def publish_velocities(self, left: float, right: float):
+        """Differential drive with explicit speeds: left value drives both
+        left wheels, right value both right wheels.  (left=-s, right=s) = CCW."""
+        rear_msg = Float32MultiArray()
+        front_msg = Float32MultiArray()
+        rear_msg.data = [float(left), float(right)]
+        front_msg.data = [float(left), float(right)]
+        self._pub_rear.publish(rear_msg)
+        self._pub_front.publish(front_msg)
+
     def stop(self):
         self.publish("STOP")

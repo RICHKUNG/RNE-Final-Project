@@ -1,0 +1,860 @@
+"""Experimental scripted mission — Task 3 (door) first, then ramp bear retrieval.
+
+No Nav2.  Localization-assisted scripted routing only:
+  * pose feedback: TF map -> base_footprint (preferred), /amcl_pose fallback
+  * route progress and turning use map-frame x, y, yaw — never bare sleeps
+  * motion/phase timing uses time.monotonic()
+
+Perception:
+  * /yolo/knob_info   — knob visual servo (Task 3)
+  * /yolo/bear_info   — bear classification + grasp
+  * /yolo/bridge_info — used as ramp info (legacy topic name; driven by
+    ramp_yolo11s.pt segmentation, class 'ramp')
+
+Run:  ros2 run rne_final_pkg scripted_final_mission
+"""
+
+import math
+import os
+import time
+from collections import deque
+from enum import Enum, auto
+
+import rclpy
+import rclpy.time
+from rclpy.node import Node
+import tf2_ros
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from ament_index_python.packages import get_package_share_directory
+import yaml
+
+from rne_final_pkg.car_driver import CarDriver
+from rne_final_pkg.arm_driver import ArmDriver
+from rne_final_pkg.yolo_client import YoloClient
+
+_BASE_FRAME = "base_footprint"
+
+
+def _yaw_from_quat(q):
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
+def _norm_ang(a):
+    """Normalize angle to (-pi, pi]."""
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+class S(Enum):
+    INIT = auto()
+
+    TASK3_ROUTE_SEGMENT_1 = auto()       # straight to route.turn_point
+    TASK3_TURN_LEFT = auto()             # to turn_point.yaw + 90°
+    TASK3_ROUTE_SEGMENT_2 = auto()       # straight to route.door_lane_point
+    TASK3_TURN_RIGHT_TO_DOOR = auto()    # to door_front.yaw
+    TASK3_ROUTE_SEGMENT_3 = auto()       # short straight to route.door_front
+    TASK3_KNOB_SERVO = auto()
+    TASK3_DOOR_PRESS_COMMIT = auto()
+
+    MOVE_TO_RAMP_OBSERVE_LONG_SIDE = auto()
+    RAMP_SCAN_LONG_SIDE = auto()
+    MOVE_TO_RAMP_OBSERVE_SHORT_SIDE = auto()
+    RAMP_SCAN_SHORT_SIDE = auto()
+    RAMP_APPROACH = auto()
+    RAMP_BEAR_CLASSIFY = auto()
+    CLEAR_BLOCKING_BEAR = auto()
+    GRASP_RAMP_BEAR = auto()
+    RETURN_ORIGIN = auto()
+
+    DONE = auto()
+    FAILED = auto()
+
+
+class ScriptedFinalMission(Node):
+    def __init__(self, node_name="scripted_final_mission"):
+        super().__init__(node_name)
+
+        self._load_config()
+
+        self.car = CarDriver(self)
+        self.arm = ArmDriver(self)
+        self.yolo = YoloClient(self)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.create_subscription(
+            PoseWithCovarianceStamped, "/amcl_pose", self._amcl_cb, 10
+        )
+
+        # pose = (x, y, yaw) in map frame; _pose_mono = monotonic stamp of update
+        self.pose = None
+        self._pose_src = "none"
+        self._pose_mono = 0.0
+        self._amcl = None
+        self._amcl_mono = 0.0
+
+        self._state = S.INIT
+        self._state_t0 = time.monotonic()
+        self._phase = 0
+        self._phase_t0 = time.monotonic()
+        self._phase_entered = False  # one-shot flag for phase entry actions
+        self._anchor = None          # per-state scratch (target yaw / start xy …)
+        self._fail_reason = None
+        self._done_logged = False
+
+        self._ramp_window = deque(maxlen=int(self.cfg["ramp"]["found_window_frames"]))
+        self._ramp_last_seq = None   # last counted seg message (see yolo_client.ramp_seq)
+        self._approach_done = False  # ramp approach reached approach_done_area at least once
+        self._classify_entries = 0
+        self._classify_samples = []
+        self._grab_retries = 0
+        self._press_attempts = 0
+        self._knob_invalid_t0 = None
+
+        # stuck detection while driving forward (route legs)
+        self._stuck_anchor = None    # (x, y, monotonic) of last confirmed movement
+        self._recover_until = 0.0    # while monotonic < this, back up instead of driving
+
+        self.create_timer(0.1, self._tick)   # 10 Hz control loop
+        self.get_logger().info(f"{self.get_name()} ready — waiting for pose + YOLO topics (INIT)")
+
+    # ------------------------------------------------------------------
+    # Config / pose
+    # ------------------------------------------------------------------
+
+    def _load_config(self):
+        share = get_package_share_directory("rne_final_pkg")
+        path = os.path.join(share, "config", "scripted_mission.yaml")
+        with open(path) as f:
+            self.cfg = yaml.safe_load(f)
+
+        # Resolve debug.start_state at startup so a typo fails immediately,
+        # not minutes into a run.
+        name = (self.cfg.get("debug") or {}).get("start_state") or ""
+        if name:
+            try:
+                self._start_state = S[name]
+            except KeyError:
+                valid = ", ".join(s.name for s in S)
+                raise ValueError(
+                    f"debug.start_state '{name}' is not a valid state. Valid: {valid}"
+                )
+        else:
+            self._start_state = S.TASK3_ROUTE_SEGMENT_1
+
+    def _amcl_cb(self, msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        self._amcl = (p.x, p.y, _yaw_from_quat(q))
+        self._amcl_mono = time.monotonic()
+
+    def _update_pose(self):
+        try:
+            tf = self.tf_buffer.lookup_transform("map", _BASE_FRAME, rclpy.time.Time())
+            t = tf.transform.translation
+            self.pose = (t.x, t.y, _yaw_from_quat(tf.transform.rotation))
+            self._pose_src = "tf"
+            self._pose_mono = time.monotonic()
+            return
+        except Exception:
+            pass
+        if self._amcl is not None:
+            self.pose = self._amcl
+            self._pose_src = "amcl"
+            self._pose_mono = self._amcl_mono
+
+    def _pose_ok(self):
+        return (
+            self.pose is not None
+            and (time.monotonic() - self._pose_mono) < self.cfg["init"]["pose_stale_s"]
+        )
+
+    # ------------------------------------------------------------------
+    # State machine core
+    # ------------------------------------------------------------------
+
+    def _goto(self, state: S):
+        self.get_logger().info(f"State: {self._state.name} -> {state.name}")
+        self._state = state
+        self._state_t0 = time.monotonic()
+        self._phase = 0
+        self._phase_t0 = time.monotonic()
+        self._phase_entered = False
+        self._anchor = None
+        self._ramp_window = deque(maxlen=int(self.cfg["ramp"]["found_window_frames"]))
+        self._ramp_last_seq = None
+        self._classify_samples = []
+        self._knob_invalid_t0 = None
+        self._stuck_anchor = None
+
+    def _phase_goto(self, phase: int):
+        self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
+        self._phase = phase
+        self._phase_t0 = time.monotonic()
+        self._phase_entered = False
+        self._anchor = self.pose[:2] if self.pose else None
+
+    def _fail(self, reason: str):
+        self._fail_reason = reason
+        self.get_logger().error(f"MISSION FAILED: {reason}")
+        self.car.stop()
+        self._goto(S.FAILED)
+
+    def _tick(self):
+        self._update_pose()
+        s = self._state
+
+        if s == S.INIT:
+            self._state_init()
+        elif s == S.TASK3_ROUTE_SEGMENT_1:
+            self._state_route(self.cfg["route"]["turn_point"], S.TASK3_TURN_LEFT)
+        elif s == S.TASK3_TURN_LEFT:
+            # left 90° from the measured heading at turn_point — not a hardcoded yaw
+            target = _norm_ang(self.cfg["route"]["turn_point"]["yaw"] + math.pi / 2.0)
+            self._state_turn_to(target, S.TASK3_ROUTE_SEGMENT_2)
+        elif s == S.TASK3_ROUTE_SEGMENT_2:
+            self._state_route(self.cfg["route"]["door_lane_point"], S.TASK3_TURN_RIGHT_TO_DOOR)
+        elif s == S.TASK3_TURN_RIGHT_TO_DOOR:
+            self._state_turn_to(self.cfg["route"]["door_front"]["yaw"], S.TASK3_ROUTE_SEGMENT_3)
+        elif s == S.TASK3_ROUTE_SEGMENT_3:
+            self._state_route(self.cfg["route"]["door_front"], S.TASK3_KNOB_SERVO)
+        elif s == S.TASK3_KNOB_SERVO:
+            self._state_knob_servo(S.TASK3_DOOR_PRESS_COMMIT)
+        elif s == S.TASK3_DOOR_PRESS_COMMIT:
+            self._state_door_press(S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE)
+        elif s == S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE:
+            self._state_move_observe(self.cfg["route"]["long_side_observe"], S.RAMP_SCAN_LONG_SIDE)
+        elif s == S.RAMP_SCAN_LONG_SIDE:
+            self._state_ramp_scan(found_next=S.RAMP_APPROACH,
+                                  not_found_next=S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE)
+        elif s == S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE:
+            self._state_move_observe(self.cfg["route"]["short_side_observe"], S.RAMP_SCAN_SHORT_SIDE)
+        elif s == S.RAMP_SCAN_SHORT_SIDE:
+            self._state_ramp_scan(found_next=S.RAMP_APPROACH, not_found_next=None)
+        elif s == S.RAMP_APPROACH:
+            self._state_ramp_approach(S.RAMP_BEAR_CLASSIFY)
+        elif s == S.RAMP_BEAR_CLASSIFY:
+            self._state_bear_classify()
+        elif s == S.CLEAR_BLOCKING_BEAR:
+            self._state_clear_blocking_bear(S.RAMP_APPROACH)
+        elif s == S.GRASP_RAMP_BEAR:
+            self._state_grasp_ramp_bear(S.RETURN_ORIGIN)
+        elif s == S.RETURN_ORIGIN:
+            self._state_return_origin(S.DONE)
+        elif s == S.DONE:
+            self.car.stop()
+            if not self._done_logged:
+                self.get_logger().info("Mission complete.")
+                self._done_logged = True
+        elif s == S.FAILED:
+            self.car.stop()
+
+    # ------------------------------------------------------------------
+    # Motion primitives (tick-based; return True when finished)
+    # ------------------------------------------------------------------
+
+    def _rotate_dir(self, direction, speed=None):
+        """direction > 0 = CCW/left, < 0 = CW/right (only the sign is used)."""
+        s = speed if speed is not None else self.cfg["control"]["turn_speed"]
+        if direction > 0:
+            self.car.publish_velocities(-s, s)   # CCW / left
+        else:
+            self.car.publish_velocities(s, -s)   # CW / right
+
+    def _turn_speed_for(self, err_rad):
+        """Slow down near the target yaw so the 10 Hz bang-bang loop doesn't
+        overshoot through the tolerance window and oscillate."""
+        c = self.cfg["control"]
+        if abs(math.degrees(err_rad)) < c["turn_slowdown_deg"]:
+            return c["slow_speed"]
+        return c["turn_speed"]
+
+    def _turn_to_yaw(self, target_yaw) -> bool:
+        _, _, yaw = self.pose
+        err = _norm_ang(target_yaw - yaw)
+        if abs(math.degrees(err)) < self.cfg["control"]["yaw_tolerance_deg"]:
+            self.car.stop()
+            return True
+        self._rotate_dir(err, self._turn_speed_for(err))
+        return False
+
+    def _stuck_check(self) -> bool:
+        """Call while commanding forward.  True when a recovery backup was
+        triggered (caller should skip its forward command this tick)."""
+        c = self.cfg["stuck"]
+        now = time.monotonic()
+        x, y, _ = self.pose
+        if self._stuck_anchor is None:
+            self._stuck_anchor = (x, y, now)
+            return False
+        ax, ay, at = self._stuck_anchor
+        if math.hypot(x - ax, y - ay) > c["move_threshold_m"]:
+            self._stuck_anchor = (x, y, now)
+            return False
+        if now - at > c["timeout_s"]:
+            self.get_logger().warn(
+                f"[{self._state.name}] STUCK — no movement for {now - at:.1f}s, "
+                f"backing up {c['recover_backward_s']:.1f}s"
+            )
+            self._recover_until = now + c["recover_backward_s"]
+            self._stuck_anchor = None
+            return True
+        return False
+
+    def _drive_to_point(self, wp, speed=None) -> bool:
+        # stuck recovery takes priority over everything
+        if time.monotonic() < self._recover_until:
+            s = self.cfg["control"]["slow_speed"]
+            self.car.publish_velocities(-s, -s)
+            return False
+
+        x, y = wp["x"], wp["y"]
+        tol = wp.get("tolerance", self.cfg["control"]["xy_tolerance"])
+        px, py, yaw = self.pose
+        dist = math.hypot(x - px, y - py)
+        if dist < tol:
+            self.car.stop()
+            self._stuck_anchor = None
+            return True
+        bearing = math.atan2(y - py, x - px)
+        err = _norm_ang(bearing - yaw)
+        if abs(math.degrees(err)) > self.cfg["control"]["forward_angle_deg"]:
+            action = "ROTATE"
+            self._stuck_anchor = None   # rotation barely translates — don't count it
+            self._rotate_dir(err, self._turn_speed_for(err))
+        else:
+            action = "FORWARD"
+            if self._stuck_check():
+                return False
+            v = speed if speed is not None else self.cfg["control"]["medium_speed"]
+            self.car.publish_velocities(v, v)
+        self.get_logger().info(
+            f"[{self._state.name}] pose=({px:.2f},{py:.2f},{math.degrees(yaw):.0f}°/{self._pose_src})  "
+            f"target=({x:.2f},{y:.2f})  dist={dist:.2f}m  heading_err={math.degrees(err):.0f}° → {action}"
+        )
+        return False
+
+    def _require_pose(self) -> bool:
+        """Stop and complain when localization is lost; True when pose usable."""
+        if self._pose_ok():
+            return True
+        self.car.stop()
+        self.get_logger().error(
+            f"[{self._state.name}] localization pose lost "
+            f"(last={time.monotonic() - self._pose_mono:.1f}s ago, src={self._pose_src}) — holding"
+        )
+        return False
+
+    # ------------------------------------------------------------------
+    # INIT
+    # ------------------------------------------------------------------
+
+    def _state_init(self):
+        missing = []
+        if self.pose is None:
+            missing.append("pose (TF map->base_footprint or /amcl_pose)")
+        if not self.yolo.knob_topic_alive():
+            missing.append("/yolo/knob_info")
+        if not self.yolo.bear_topic_alive():
+            missing.append("/yolo/bear_info")
+        if not self.yolo.ramp_topic_alive():
+            missing.append("/yolo/bridge_info (ramp seg)")
+
+        if not missing:
+            self.arm.reset()   # stow arm clear of the camera
+            x, y, yaw = self.pose
+            self.get_logger().info(
+                f"[INIT] ready  pose=({x:.2f},{y:.2f},{math.degrees(yaw):.0f}°) src={self._pose_src}"
+            )
+            if self._start_state is not S.TASK3_ROUTE_SEGMENT_1:
+                self.get_logger().warn(
+                    f"[INIT] debug.start_state set — jumping to {self._start_state.name} "
+                    f"(earlier states skipped; mission context like a held bear is on you)"
+                )
+            self._goto(self._start_state)
+            return
+
+        elapsed = time.monotonic() - self._state_t0
+        if elapsed > self.cfg["init"]["wait_timeout_s"]:
+            self._fail(f"INIT timeout after {elapsed:.0f}s — missing: {', '.join(missing)}")
+            return
+        self.get_logger().info(f"[INIT] waiting ({elapsed:.1f}s)  missing: {', '.join(missing)}")
+
+    # ------------------------------------------------------------------
+    # Task 3 — route, knob servo, door press
+    # ------------------------------------------------------------------
+
+    def _state_route(self, wp, next_state):
+        if not self._require_pose():
+            return
+        if self._drive_to_point(wp):
+            self._goto(next_state)
+
+    def _state_turn_to(self, target_yaw, next_state):
+        """Turn in place to an absolute map-frame yaw (from route config)."""
+        if not self._require_pose():
+            return
+        if self._anchor is None:
+            self._anchor = _norm_ang(target_yaw)
+            self.get_logger().info(
+                f"[{self._state.name}] target yaw={math.degrees(self._anchor):.0f}°"
+            )
+        if self._turn_to_yaw(self._anchor):
+            self._goto(next_state)
+
+    # Knob source indirection — door_test overrides these to fall back to
+    # /yolo/target_info when /yolo/knob_info is not being published.
+    def _knob_visible(self):
+        return self.yolo.knob_visible()
+
+    def _knob_dx(self):
+        return self.yolo.knob_delta_x()
+
+    def _knob_depth(self):
+        return self.yolo.knob_distance()
+
+    def _state_knob_servo(self, next_state):
+        c = self.cfg["knob_servo"]
+        slow = self.cfg["control"]["slow_speed"]
+        elapsed = time.monotonic() - self._state_t0
+        if elapsed > c["max_seconds"]:
+            self._fail(f"knob servo timeout after {elapsed:.0f}s (knob_visible={self._knob_visible()})")
+            return
+
+        if not self._knob_visible():
+            self._knob_invalid_t0 = None
+            self.get_logger().info(f"[KNOB_SERVO] no knob ({elapsed:.1f}s) → rotate CW search")
+            self.car.publish_velocities(slow, -slow)
+            return
+
+        dx = self._knob_dx()
+        depth = self._knob_depth()
+
+        if abs(dx) > c["center_threshold_px"]:
+            self._knob_invalid_t0 = None
+            self.get_logger().info(f"[KNOB_SERVO] dx={dx:.0f}px depth={depth:.2f}m → rotate")
+            self._rotate_dir(-dx, speed=slow)   # dx>0 = knob right of center → CW
+            return
+
+        # centered — close in on depth
+        if depth <= 0:
+            now = time.monotonic()
+            if self._knob_invalid_t0 is None:
+                self._knob_invalid_t0 = now
+            self.car.stop()
+            held = now - self._knob_invalid_t0
+            self.get_logger().warn(f"[KNOB_SERVO] knob centered but depth invalid ({held:.1f}s)")
+            if held > c["invalid_depth_fail_s"]:
+                self._fail("knob centered but depth stayed invalid — cannot range the door")
+            return
+        self._knob_invalid_t0 = None
+
+        if depth > c["target_depth_m"]:
+            self.get_logger().info(
+                f"[KNOB_SERVO] centered dx={dx:.0f}px  depth={depth:.2f}m > {c['target_depth_m']}m → FORWARD_SLOW"
+            )
+            self.car.publish_velocities(slow, slow)
+            return
+
+        self.get_logger().info(
+            f"[KNOB_SERVO] aligned  dx={dx:.0f}px  depth={depth:.2f}m → commit (camera goes blind now)"
+        )
+        self.car.stop()
+        self._press_attempts = 0
+        self._goto(next_state)
+
+    def _dist_from_anchor(self):
+        if self._anchor is None or self.pose is None:
+            return 0.0
+        return math.hypot(self.pose[0] - self._anchor[0], self.pose[1] - self._anchor[1])
+
+    def _commit_forward_done(self, target_m) -> bool:
+        """Open-loop commit forward: pose distance preferred, phase timeout as
+        watchdog (the arm may block the camera and skid can degrade pose)."""
+        elapsed = time.monotonic() - self._phase_t0
+        if self._pose_ok() and self._dist_from_anchor() >= target_m:
+            return True
+        if elapsed > self.cfg["door_press"]["phase_timeout_s"]:
+            self.get_logger().warn(
+                f"[DOOR_PRESS] phase watchdog ({elapsed:.1f}s) — advancing "
+                f"(moved={self._dist_from_anchor():.2f}m of {target_m:.2f}m)"
+            )
+            return True
+        return False
+
+    def _state_door_press(self, next_state):
+        """Scripted open-loop commit — no knob vision from here on."""
+        c = self.cfg["door_press"]
+        elapsed = time.monotonic() - self._phase_t0
+
+        if self._phase == 0:       # raise arm
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info(f"[DOOR_PRESS] raise arm {c['arm_raise_deg']}")
+                self.arm.set_angles_deg(*c["arm_raise_deg"])
+            self.car.stop()
+            if elapsed > c["arm_settle_s"]:
+                self._phase_goto(1)
+
+        elif self._phase == 1:     # short forward to bring knob into arm reach
+            self.car.publish_velocities(c["push_speed"], c["push_speed"])
+            if self._commit_forward_done(c["forward_before_press_m"]):
+                self.car.stop()
+                self._phase_goto(2)
+
+        elif self._phase == 2:     # press knob downward
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info(
+                    f"[DOOR_PRESS] press attempt {self._press_attempts + 1}: arm {c['arm_press_deg']}"
+                )
+                self.arm.set_angles_deg(*c["arm_press_deg"])
+            self.car.stop()
+            if elapsed > c["arm_settle_s"]:
+                self._phase_goto(3)
+
+        elif self._phase == 3:     # push door forward while pressing
+            self.car.publish_velocities(c["push_speed"], c["push_speed"])
+            target = c["forward_during_press_m"] + c["push_after_unlock_m"]
+            if self._commit_forward_done(target):
+                self.car.stop()
+                self._press_attempts += 1
+                if self._press_attempts <= c["retry_count"]:
+                    # No door-open feedback exists (camera blocked by the arm):
+                    # retry_count > 0 means unconditional scripted re-press.
+                    self.get_logger().warn("[DOOR_PRESS] scripted retry — backing up to re-press")
+                    self._phase_goto(4)
+                else:
+                    self._phase_goto(5)
+
+        elif self._phase == 4:     # back up, then re-press
+            self.car.publish_velocities(-c["push_speed"], -c["push_speed"])
+            target = c["forward_during_press_m"] + c["push_after_unlock_m"]
+            if self._commit_forward_done(target):
+                self.car.stop()
+                self._phase_goto(2)
+
+        elif self._phase == 5:     # retract arm and finish
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info("[DOOR_PRESS] retract arm → reset")
+                self.arm.set_angles_deg(*c["arm_raise_deg"])
+            self.car.stop()
+            if elapsed > c["arm_settle_s"]:
+                self.arm.reset()
+                self.get_logger().info(
+                    "[DOOR_PRESS] commit done "
+                    "(TODO: no door-open verification possible — camera was blocked)"
+                )
+                self._goto(next_state)
+
+    # ------------------------------------------------------------------
+    # Ramp — observe, scan, approach
+    # ------------------------------------------------------------------
+
+    def _state_move_observe(self, wp, next_state):
+        if not self._require_pose():
+            return
+        if self._phase == 0:
+            if self._drive_to_point(wp):
+                self._phase_goto(1)
+        elif self._phase == 1:
+            if self._turn_to_yaw(wp["yaw"]):
+                self._goto(next_state)
+
+    def _state_ramp_scan(self, found_next, not_found_next):
+        c = self.cfg["ramp"]
+        self.car.stop()
+
+        # Count distinct seg inferences only — seg publishes ~1 Hz while this
+        # loop ticks at 10 Hz, so re-reading the same sticky message must not
+        # accumulate hits.  Messages from before this state entered are skipped.
+        seq = self.yolo.ramp_seq()
+        if self._ramp_last_seq is None:
+            self._ramp_last_seq = seq
+        elif seq != self._ramp_last_seq:
+            self._ramp_last_seq = seq
+            found = self.yolo.ramp_visible() and self.yolo.ramp_area_ratio() > c["found_area_threshold"]
+            self._ramp_window.append(1 if found else 0)
+
+        hits = sum(self._ramp_window)
+        elapsed = time.monotonic() - self._state_t0
+
+        self.get_logger().info(
+            f"[{self._state.name}] hits={hits}/{c['found_required_frames']} "
+            f"(seg msgs seen={len(self._ramp_window)})  area={self.yolo.ramp_area_ratio():.3f}  "
+            f"elapsed={elapsed:.1f}/{c['scan_seconds']:.0f}s"
+        )
+
+        if hits >= c["found_required_frames"]:
+            self.get_logger().info(f"[{self._state.name}] ramp confirmed → {found_next.name}")
+            self._goto(found_next)
+            return
+
+        if elapsed > c["scan_seconds"]:
+            if not_found_next is not None:
+                self.get_logger().warn(
+                    f"[{self._state.name}] ramp not seen from this side → {not_found_next.name}"
+                )
+                self._goto(not_found_next)
+            else:
+                self._fail("ramp not found from either observation side")
+
+    def _state_ramp_approach(self, next_state):
+        c = self.cfg["ramp"]
+        b = self.cfg["bear"]
+        elapsed = time.monotonic() - self._state_t0
+        if elapsed > c["approach_timeout_s"]:
+            self._fail(f"ramp approach timeout after {elapsed:.0f}s")
+            return
+
+        # A close bear takes priority over ramp alignment
+        if self.yolo.bear_visible() and 0 < self.yolo.bear_distance() < b["blocking_depth_threshold_m"]:
+            self.get_logger().info(
+                f"[RAMP_APPROACH] bear at {self.yolo.bear_distance():.2f}m → classify"
+            )
+            self.car.stop()
+            self._goto(S.RAMP_BEAR_CLASSIFY)
+            return
+
+        if not self.yolo.ramp_visible():
+            self.get_logger().info(f"[RAMP_APPROACH] ramp lost ({elapsed:.1f}s) → rotate CW search")
+            s = self.cfg["control"]["slow_speed"]
+            self.car.publish_velocities(s, -s)
+            return
+
+        area = self.yolo.ramp_area_ratio()
+        dx = self.yolo.ramp_delta_x()
+
+        if area >= c["approach_done_area"]:
+            self.get_logger().info(f"[RAMP_APPROACH] area={area:.3f} ≥ {c['approach_done_area']} → classify")
+            self.car.stop()
+            self._approach_done = True
+            self._goto(S.RAMP_BEAR_CLASSIFY)
+            return
+
+        if abs(dx) > c["center_threshold_px"]:
+            self.get_logger().info(f"[RAMP_APPROACH] dx={dx:.0f}px area={area:.3f} → rotate")
+            self._rotate_dir(-dx, speed=self.cfg["control"]["slow_speed"])
+        else:
+            self.get_logger().info(f"[RAMP_APPROACH] aligned  area={area:.3f} → forward")
+            v = c["approach_speed"]
+            self.car.publish_velocities(v, v)
+
+    # ------------------------------------------------------------------
+    # Bear classification / handling
+    # ------------------------------------------------------------------
+
+    def _state_bear_classify(self):
+        b = self.cfg["bear"]
+        self.car.stop()
+
+        if self._phase == 0:
+            self._classify_entries += 1
+            if self._classify_entries > 5:
+                self._fail("bear classification looped 5× without a stable result")
+                return
+            self._phase_goto(1)
+            return
+
+        if self.yolo.bear_visible():
+            self._classify_samples.append(
+                (self.yolo.bear_distance(), self.yolo.bear_pixel_y())
+            )
+
+        elapsed = time.monotonic() - self._phase_t0
+        if elapsed < b["classify_observe_seconds"]:
+            return
+
+        if not self._classify_samples:
+            if self._approach_done:
+                self._fail(
+                    "ramp reached but no bear visible — "
+                    "TODO: extend search pattern around the ramp"
+                )
+            else:
+                self.get_logger().warn("[CLASSIFY] no bear samples yet → resume RAMP_APPROACH")
+                self._goto(S.RAMP_APPROACH)
+            return
+
+        n = len(self._classify_samples)
+        avg_d = sum(s[0] for s in self._classify_samples) / n
+        avg_py = sum(s[1] for s in self._classify_samples) / n
+        blocking = (
+            avg_py > b["blocking_pixel_y_threshold"]
+            and avg_d < b["blocking_depth_threshold_m"]
+        )
+        self.get_logger().info(
+            f"[CLASSIFY] n={n}  avg_depth={avg_d:.2f}m  avg_pixel_y={avg_py:.0f}  "
+            f"→ {'BLOCKING_BEAR' if blocking else 'RAMP_BEAR'}"
+        )
+        self._goto(S.CLEAR_BLOCKING_BEAR if blocking else S.GRASP_RAMP_BEAR)
+
+    def _bear_servo_step(self) -> bool:
+        """Align + close on the bear; True when at grab distance.
+        Calls _fail on servo timeout."""
+        b = self.cfg["bear"]
+        slow = self.cfg["control"]["slow_speed"]
+        elapsed = time.monotonic() - self._phase_t0
+
+        if elapsed > b["servo_timeout_s"]:
+            self._fail(f"bear servo timeout after {elapsed:.0f}s in {self._state.name}")
+            return False
+
+        if not self.yolo.bear_visible():
+            self.get_logger().info(f"[{self._state.name}] bear lost ({elapsed:.1f}s) → rotate CW search")
+            self.car.publish_velocities(slow, -slow)
+            return False
+
+        dx = self.yolo.bear_delta_x()
+        d = self.yolo.bear_distance()
+
+        if abs(dx) > b["align_threshold_px"]:
+            self.get_logger().info(f"[{self._state.name}] dx={dx:.0f}px d={d:.2f}m → rotate")
+            self._rotate_dir(-dx, speed=slow)
+            return False
+        if 0 < d <= b["grab_distance_m"]:
+            self.car.stop()
+            return True
+        self.get_logger().info(f"[{self._state.name}] aligned d={d:.2f}m → forward slow")
+        self.car.publish_velocities(slow, slow)
+        return False
+
+    def _state_clear_blocking_bear(self, next_state):
+        b = self.cfg["bear"]
+        elapsed = time.monotonic() - self._phase_t0
+
+        if self._phase == 0:       # servo to the blocking bear
+            if self._bear_servo_step():
+                self._phase_goto(1)
+
+        elif self._phase == 1:     # grab (blocking helper, ~4.5 s)
+            self.get_logger().info("[CLEAR_BEAR] grab sequence")
+            self.arm.grab_sequence()
+            self._phase_goto(2)
+
+        elif self._phase == 2:     # back away from the ramp entrance
+            self.car.publish_velocities(
+                -self.cfg["control"]["slow_speed"], -self.cfg["control"]["slow_speed"]
+            )
+            if elapsed > b["clear_backward_seconds"]:
+                self._phase_goto(3)
+
+        elif self._phase == 3:     # turn aside (CW)
+            s = self.cfg["control"]["turn_speed"]
+            self.car.publish_velocities(s, -s)
+            if elapsed > b["clear_rotate_seconds"]:
+                self.car.stop()
+                self._phase_goto(4)
+
+        elif self._phase == 4:     # drop the bear beside the path
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info("[CLEAR_BEAR] dropping bear aside")
+                self.arm.open_gripper()
+            if elapsed > 1.0:
+                self.arm.reset()
+                self._phase_goto(5)
+
+        elif self._phase == 5:     # turn back toward the ramp (CCW)
+            s = self.cfg["control"]["turn_speed"]
+            self.car.publish_velocities(-s, s)
+            if elapsed > b["clear_rotate_seconds"]:
+                self.car.stop()
+                self.get_logger().info("[CLEAR_BEAR] cleared → back to ramp approach")
+                self._goto(next_state)
+
+    def _state_grasp_ramp_bear(self, next_state):
+        b = self.cfg["bear"]
+        elapsed = time.monotonic() - self._phase_t0
+
+        if self._phase == 0:       # servo to the ramp bear
+            if self._bear_servo_step():
+                self._phase_goto(1)
+
+        elif self._phase == 1:     # grab
+            self.get_logger().info("[GRASP_RAMP_BEAR] grab sequence")
+            self.arm.grab_sequence()
+            self._phase_goto(2)
+
+        elif self._phase == 2:     # verify: back up briefly
+            self.car.publish_velocities(
+                -self.cfg["control"]["slow_speed"], -self.cfg["control"]["slow_speed"]
+            )
+            if elapsed > b["verify_backup_seconds"]:
+                self.car.stop()
+                self._phase_goto(3)
+
+        elif self._phase == 3:     # verify: observe
+            self.car.stop()
+            if elapsed < b["verify_observe_seconds"]:
+                return
+            d = self.yolo.bear_distance()
+            still_there = self.yolo.bear_visible() and 0 < d < b["grab_distance_m"]
+            if still_there:
+                self._grab_retries += 1
+                if self._grab_retries > b["grab_retry_max"]:
+                    self._fail(f"grab failed {self._grab_retries}× — bear still at {d:.2f}m")
+                    return
+                self.get_logger().warn(
+                    f"[GRASP_RAMP_BEAR] bear still at {d:.2f}m — retry {self._grab_retries}/{b['grab_retry_max']}"
+                )
+                self._phase_goto(0)
+            else:
+                self.get_logger().info(f"[GRASP_RAMP_BEAR] grasp OK (d={d:.2f}m) → return")
+                self._goto(next_state)
+
+    # ------------------------------------------------------------------
+    # Return / drop
+    # ------------------------------------------------------------------
+
+    def _state_return_origin(self, next_state):
+        r = self.cfg["return"]
+        elapsed = time.monotonic() - self._phase_t0
+
+        if self._phase == 0:
+            if not self._require_pose():
+                return
+            if self._drive_to_point(self.cfg["route"]["origin"]):
+                if r["drop_at_origin"]:
+                    self._phase_goto(1)
+                else:
+                    self.get_logger().info(
+                        "[RETURN] at origin — holding bear (drop_at_origin=false)"
+                    )
+                    self._goto(next_state)
+
+        elif self._phase == 1:     # drop
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info("[RETURN] dropping bear at origin")
+                self.arm.open_gripper()
+            self.car.stop()
+            if elapsed > r["drop_wait_seconds"]:
+                self._phase_goto(2)
+
+        elif self._phase == 2:     # back away and stow
+            self.car.publish_velocities(
+                -self.cfg["control"]["slow_speed"], -self.cfg["control"]["slow_speed"]
+            )
+            if elapsed > r["back_away_seconds"]:
+                self.car.stop()
+                self.arm.reset()
+                self._goto(next_state)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ScriptedFinalMission()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.car.stop()
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

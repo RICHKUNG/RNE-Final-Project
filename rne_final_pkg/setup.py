@@ -18,6 +18,8 @@ setup(
     entry_points={
         'console_scripts': [
             'final_mission = rne_final_pkg.final_mission:main',
+            'scripted_final_mission = rne_final_pkg.scripted_final_mission:main',
+            'door_test     = rne_final_pkg.door_test:main',
             'topic_check   = rne_final_pkg.topic_check:main',
             'yolo_align    = rne_final_pkg.yolo_align:main',
             'get_bear      = rne_final_pkg.get_bear_node:main',

@@ -7,10 +7,15 @@ class YoloClient:
         self._info = None
         self._marker = None
         self._bridge_info = None
+        self._bridge_seq = 0
+        self._bear_info = None
+        self._knob_info = None
 
         node.create_subscription(Float32MultiArray, "/yolo/target_info", self._info_cb, 10)
         node.create_subscription(Marker, "/yolo/target_marker", self._marker_cb, 10)
         node.create_subscription(Float32MultiArray, "/yolo/bridge_info", self._bridge_cb, 10)
+        node.create_subscription(Float32MultiArray, "/yolo/bear_info", self._bear_cb, 10)
+        node.create_subscription(Float32MultiArray, "/yolo/knob_info", self._knob_cb, 10)
 
     def _info_cb(self, msg):
         self._info = list(msg.data)
@@ -20,6 +25,16 @@ class YoloClient:
 
     def _bridge_cb(self, msg):
         self._bridge_info = list(msg.data)
+        self._bridge_seq += 1
+
+    def _bear_cb(self, msg):
+        self._bear_info = list(msg.data)
+
+    def _knob_cb(self, msg):
+        self._knob_info = list(msg.data)
+
+    def target_topic_alive(self):
+        return self._info is not None
 
     def is_visible(self):
         return self._info is not None and len(self._info) >= 1 and self._info[0] == 1.0
@@ -45,3 +60,60 @@ class YoloClient:
 
     def bridge_area_ratio(self):
         return self._bridge_info[2] if self._bridge_info and len(self._bridge_info) >= 3 else 0.0
+
+    # ── ramp accessors ────────────────────────────────────────────────
+    # The seg model now detects the ramp face; data still arrives on the
+    # legacy /yolo/bridge_info topic.  New code should use these names.
+
+    def ramp_topic_alive(self):
+        return self._bridge_info is not None
+
+    def ramp_seq(self):
+        """Monotonic count of seg messages received.  Seg runs every
+        SEG_CHECK_INTERVAL camera frames (~1 Hz) — far slower than a 10 Hz
+        control loop — so confirmation logic must count distinct messages,
+        not control ticks re-reading the same sticky value."""
+        return self._bridge_seq
+
+    def ramp_visible(self):
+        return self.bridge_visible()
+
+    def ramp_delta_x(self):
+        return self.bridge_delta_x()
+
+    def ramp_area_ratio(self):
+        return self.bridge_area_ratio()
+
+    # ── bear_info accessors ───────────────────────────────────────────
+    # /yolo/bear_info: [found, distance, delta_x, pixel_x, pixel_y]
+
+    def bear_topic_alive(self):
+        return self._bear_info is not None
+
+    def bear_visible(self):
+        return self._bear_info is not None and len(self._bear_info) >= 1 and self._bear_info[0] == 1.0
+
+    def bear_distance(self):
+        return self._bear_info[1] if self._bear_info and len(self._bear_info) >= 2 else float("inf")
+
+    def bear_delta_x(self):
+        return self._bear_info[2] if self._bear_info and len(self._bear_info) >= 3 else 0.0
+
+    def bear_pixel_y(self):
+        return self._bear_info[4] if self._bear_info and len(self._bear_info) >= 5 else 0.0
+
+    # ── knob_info accessors ───────────────────────────────────────────
+    # /yolo/knob_info: [found, distance, delta_x, pixel_x, pixel_y, area, conf]
+    # distance = -1.0 when depth is invalid.
+
+    def knob_topic_alive(self):
+        return self._knob_info is not None
+
+    def knob_visible(self):
+        return self._knob_info is not None and len(self._knob_info) >= 1 and self._knob_info[0] == 1.0
+
+    def knob_distance(self):
+        return self._knob_info[1] if self._knob_info and len(self._knob_info) >= 2 else -1.0
+
+    def knob_delta_x(self):
+        return self._knob_info[2] if self._knob_info and len(self._knob_info) >= 3 else 0.0
