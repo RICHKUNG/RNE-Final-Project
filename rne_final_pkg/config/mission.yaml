@@ -6,8 +6,8 @@ search_rotation_timeout: 30.0
 plan_follow_min_dist: 0.5
 plan_forward_angle_deg: 20.0
 
-visual_servo_deadband_px: 120.0
-visual_servo_rotate_threshold_px: 180.0
+visual_servo_deadband_px: 60.0
+visual_servo_rotate_threshold_px: 80.0
 
 bridge_deadband_px: 100.0
 bridge_min_area_ratio: 0.03
@@ -22,3 +22,7 @@ bridge_avoid_turn_seconds: 0.8
 clear_backward_seconds: 2.0
 clear_rotate_seconds: 1.0
 clear_forward_seconds: 1.0
+
+# Grab verification (T*_VERIFY states)
+verify_backup_seconds: 0.4
+verify_observe_seconds: 0.8

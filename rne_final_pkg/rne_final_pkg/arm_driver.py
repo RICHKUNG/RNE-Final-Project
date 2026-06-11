@@ -15,7 +15,12 @@ def _deg(*angles):
 
 RESET_POS  = _deg(90, 30, 160, 180, 10)
 
-# Pre-grab: arm extended forward and slightly down — TUNE THESE VALUES
+# Intermediate raise: arm pointing upward with gripper open.
+# Reached BEFORE extending toward the bear so the arm descends from above
+# rather than sweeping horizontally through the bear. TUNE if needed.
+RAISE_POS = _deg(90, 10, 150, 180, 70)      # shoulder up, elbow still folded, gripper open
+
+# Pre-grab: arm extended forward/down toward bear — TUNE THESE VALUES
 PRE_GRAB_POS = _deg(90, 70, 100, 120, 70)   # gripper open
 
 GRIPPER_OPEN   = math.radians(70)
@@ -53,23 +58,31 @@ class ArmDriver:
     def grab_sequence(self, x_target=0.15, z_target=0.05):
         """
         Fixed grab sequence (Level 2 — no IK).
-        x_target / z_target are accepted for interface compatibility with Level 3
-        but are ignored here; use hardcoded PRE_GRAB_POS instead.
-        Tune PRE_GRAB_POS angles to match the physical grab position.
-        """
-        # 1. open gripper and extend arm
-        self._joint_pos = list(PRE_GRAB_POS)
-        self._joint_pos[-1] = GRIPPER_OPEN
-        self._publish()
-        time.sleep(1.5)
+        x_target / z_target are accepted for interface compatibility but ignored.
+        Tune RAISE_POS / PRE_GRAB_POS angles and sleep durations to match the
+        physical setup.
 
-        # 2. close gripper
+        Approach order: RAISE (arm up, gripper open) → PRE_GRAB (descend onto
+        bear) → close → RESET (lift away).  Going via RAISE avoids the arm
+        sweeping horizontally through the bear during extension.
+        """
+        # 1. raise arm upward, open gripper — safe pre-position
+        self._joint_pos = list(RAISE_POS)
+        self._publish()
+        time.sleep(1.0)
+
+        # 2. descend / extend toward bear
+        self._joint_pos = list(PRE_GRAB_POS)
+        self._publish()
+        time.sleep(1.0)
+
+        # 3. close gripper
         self._joint_pos[-1] = GRIPPER_CLOSED
         self._publish()
         time.sleep(1.0)
 
-        # 3. lift back toward reset
+        # 4. lift back toward reset while holding
         self._joint_pos = list(RESET_POS)
-        self._joint_pos[-1] = GRIPPER_CLOSED   # keep holding
+        self._joint_pos[-1] = GRIPPER_CLOSED
         self._publish()
         time.sleep(1.5)

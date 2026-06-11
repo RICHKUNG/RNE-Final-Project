@@ -141,6 +141,16 @@ class GetBearNode(Node):
         with open(path) as f:
             self.params = yaml.safe_load(f)
 
+        # Use goals.yaml:origin as home if not already set in get_bear.yaml
+        goals_path = os.path.join(share, "config", "goals.yaml")
+        if os.path.exists(goals_path):
+            with open(goals_path) as f:
+                goals = yaml.safe_load(f)
+            origin = goals.get("origin", None)
+            if origin and len(origin) >= 2:
+                self.params.setdefault("home_x", float(origin[0]))
+                self.params.setdefault("home_y", float(origin[1]))
+
     # ------------------------------------------------------------------
     # /initialpose — publish once if AMCL has no pose yet
     # ------------------------------------------------------------------
@@ -544,7 +554,7 @@ class GetBearNode(Node):
             action = "CLOCKWISE_ROTATION_SLOW"
         elif dx < -rotate_th:
             action = "COUNTERCLOCKWISE_ROTATION_SLOW"
-        elif dist < 0 or (0 < dist < grab_th):
+        elif 0 < dist < grab_th:
             action = "→ GRAB"
         else:
             action = "FORWARD_SLOW"

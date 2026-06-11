@@ -27,6 +27,7 @@ class S(Enum):
     T1_OBS    = auto()
     T1_APPR   = auto()
     T1_GRAB   = auto()
+    T1_VERIFY = auto()
 
     T2_NAV_APPROACH  = auto()
     T2_BRIDGE_ALIGN  = auto()
@@ -35,6 +36,7 @@ class S(Enum):
     T2_OBS           = auto()
     T2_APPR          = auto()
     T2_GRAB          = auto()
+    T2_VERIFY        = auto()
     T2_EXIT          = auto()
 
     T3_NAV    = auto()
@@ -42,6 +44,7 @@ class S(Enum):
     T3_OBS    = auto()
     T3_APPR   = auto()
     T3_UNLOCK = auto()
+    T3_VERIFY = auto()
     T3_CLEAR  = auto()
 
     BRIDGE_AVOID = auto()
@@ -72,6 +75,7 @@ class FinalMission(Node):
         self._recovery_until = 0.0
         self._avoid_return   = S.IDLE   # state to resume after BRIDGE_AVOID
         self._avoid_dx       = 0.0      # bridge delta_x captured at avoidance start
+        self._verify_retry   = S.IDLE   # APPR state to retry on verify failure
 
         # 10 Hz control loop
         self.create_timer(0.1, self._tick)
@@ -122,7 +126,9 @@ class FinalMission(Node):
         elif s == S.T1_APPR:
             self._state_approach(S.T1_GRAB)
         elif s == S.T1_GRAB:
-            self._state_grab(S.T2_NAV_APPROACH)
+            self._state_grab(S.T1_VERIFY)
+        elif s == S.T1_VERIFY:
+            self._state_verify_grab(S.T2_NAV_APPROACH, S.T1_APPR)
 
         # ---- Task 2 ----
         elif s == S.T2_NAV_APPROACH:
@@ -139,7 +145,9 @@ class FinalMission(Node):
         elif s == S.T2_APPR:
             self._state_approach(S.T2_GRAB)
         elif s == S.T2_GRAB:
-            self._state_grab(S.T2_EXIT)
+            self._state_grab(S.T2_VERIFY)
+        elif s == S.T2_VERIFY:
+            self._state_verify_grab(S.T2_EXIT, S.T2_APPR)
         elif s == S.T2_EXIT:
             goal = self.goals["task2_bridge_exit"]
             self._state_nav_single(goal, S.T3_NAV)
@@ -154,7 +162,9 @@ class FinalMission(Node):
         elif s == S.T3_APPR:
             self._state_approach(S.T3_UNLOCK)
         elif s == S.T3_UNLOCK:
-            self._state_grab(S.T3_CLEAR)
+            self._state_grab(S.T3_VERIFY)
+        elif s == S.T3_VERIFY:
+            self._state_verify_grab(S.T3_CLEAR, S.T3_APPR)
         elif s == S.T3_CLEAR:
             self._state_clear(S.DONE)
 
@@ -358,8 +368,6 @@ class FinalMission(Node):
             action = "COUNTERCLOCKWISE_ROTATION_SLOW"
         elif 0 < dist < grab_th:
             action = "→ GRAB"
-        elif dist < 0:
-            action = "→ GRAB (depth invalid)"
         else:
             action = "FORWARD_SLOW"
 
@@ -409,18 +417,19 @@ class FinalMission(Node):
             self.get_logger().warn("No marker; using default grab target.")
             return default
 
-        pt_map = PointStamped()
-        pt_map.header.frame_id = "map"
-        pt_map.header.stamp = self.get_clock().now().to_msg()
-        pt_map.point = marker.pose.position
+        # Use the frame the marker was actually published in (camera frame)
+        pt = PointStamped()
+        pt.header.frame_id = marker.header.frame_id
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.point = marker.pose.position
 
         try:
             tf = self.tf_buffer.lookup_transform(
-                "arm_ik_base", "map",
+                "arm_ik_base", marker.header.frame_id,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.5),
             )
-            pt_arm = tf2_geometry_msgs.do_transform_point(pt_map, tf)
+            pt_arm = tf2_geometry_msgs.do_transform_point(pt, tf)
             x = pt_arm.point.x
             z = pt_arm.point.z
             self.get_logger().info(f"Arm target from TF: x={x:.3f}, z={z:.3f}")
@@ -428,6 +437,48 @@ class FinalMission(Node):
         except Exception as e:
             self.get_logger().warn(f"TF grab failed: {e}; using default.")
             return default
+
+    # ------------------------------------------------------------------
+    # Grab verification — back up briefly and confirm bear is gone
+    # ------------------------------------------------------------------
+
+    def _state_verify_grab(self, success_state: S, retry_state: S):
+        """
+        After a grab attempt: back up, then check whether the bear is still
+        visible at grab range.  If it is → grab failed, retry approach.
+        If not (bear gone or now on the arm at very close range) → success.
+        """
+        if self._state_start is None:
+            self._state_start = time.time()
+
+        elapsed  = time.time() - self._state_start
+        back_t   = self.params.get("verify_backup_seconds", 0.4)
+        obs_t    = back_t + self.params.get("verify_observe_seconds", 0.8)
+
+        if elapsed < back_t:
+            self.car.publish("BACKWARD_SLOW")
+            return
+
+        self.car.stop()
+
+        if elapsed < obs_t:
+            return   # still observing
+
+        dist     = self.yolo.distance()
+        grab_th  = self.params["grab_distance_threshold"]
+        # Bear still at grab distance with valid depth → grab failed
+        still_there = self.yolo.is_visible() and 0 < dist < grab_th
+
+        if still_there:
+            self.get_logger().warn(
+                f"[VERIFY] Grab failed — bear still at dist={dist:.2f}m → {retry_state.name}"
+            )
+            self._goto(retry_state)
+        else:
+            self.get_logger().info(
+                f"[VERIFY] Grab OK (dist={dist:.2f}m) → {success_state.name}"
+            )
+            self._goto(success_state)
 
     # ------------------------------------------------------------------
     # Bridge avoidance — back up then turn away, then resume saved state

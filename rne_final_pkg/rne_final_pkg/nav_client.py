@@ -36,7 +36,8 @@ class NavClient:
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.pose.position.x = float(x)
         msg.pose.position.y = float(y)
-        msg.pose.orientation.w = 1.0
+        msg.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.orientation.w = math.cos(yaw / 2.0)
         self._goal_pub.publish(msg)
         self._current_goal = [float(x), float(y)]
         self.has_plan = False
