@@ -61,11 +61,11 @@ route:
       yaw: -3.119820     # yaw_deg -178.75
       tolerance: 0.25
   short_side_observe:  # car faces ≈ +y, scanning the ramp from the short side
-    - x: 1.9789964857296893
+    - x: 1.8089964857296893
       y: -0.04615138122065065
       yaw: 1.556845      # yaw_deg 89.21
       tolerance: 0.25
-    - x: 1.464922645232404
+    - x: 1.384922645232404
       y: -0.17849396546502885
       yaw: 1.687163      # yaw_deg 96.66
       tolerance: 0.25
@@ -242,13 +242,26 @@ bear:
   # the gripper closes. Matches get_bear_node's grab_wait_seconds. TUNE to the rig.
   grab_wait_seconds: 12.0
   servo_timeout_s: 20.0      # bear lost during servo for this long → FAILED
-  grab_retry_max: 2
+  # Do not auto-retry ramp-bear grabs by default. The auto-arm sequence opens the
+  # gripper first; if the first grab already succeeded and the bear is visible in
+  # front of the camera, a retry drops it.
+  verify_retry_on_ground: false
+  grab_retry_max: 2          # used only when verify_retry_on_ground=true
+  verify_held_depth_m: 0.7
+  verify_held_pixel_y_max: 360.0
   verify_backup_seconds: 0.5
   verify_observe_seconds: 0.8
   clear_backward_seconds: 1.0
   clear_rotate_seconds: 1.2
 
 return:
+  # Before driving home, leave the bridge/ramp in the safe direction:
+  #   horizontal bridge (yaw near ±180°) → reverse 1.0 m down the bridge
+  #   vertical bridge (yaw near +90°)   → drive forward 1.5 m down the bridge
+  bridge_yaw_select_threshold_deg: 55.0
+  bridge_exit_speed: 300.0
+  horizontal_reverse_m: 1.0
+  vertical_forward_m: 1.5
   drop_at_origin: true       # false = hold the bear at origin until task trigger
   drop_wait_seconds: 2.0
   back_away_seconds: 1.0

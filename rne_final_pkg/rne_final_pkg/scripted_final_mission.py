@@ -146,6 +146,7 @@ class ScriptedFinalMission(Node):
         self._classify_entries = 0
         self._classify_samples = []
         self._grab_retries = 0
+        self._return_exit_mode = None
         self._press_attempts = 0
         self._knob_invalid_t0 = None
         self._servo_settle_t0 = None     # knob servo: in-window settle timer
@@ -271,6 +272,7 @@ class ScriptedFinalMission(Node):
         self._knob_invalid_t0 = None
         self._servo_settle_t0 = None
         self._stuck_anchor = None
+        self._return_exit_mode = None
 
     def _phase_goto(self, phase: int):
         self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
@@ -1176,50 +1178,131 @@ class ScriptedFinalMission(Node):
             if elapsed < b["verify_observe_seconds"]:
                 return
             d = self.yolo.bear_distance()
-            still_there = self.yolo.bear_visible() and 0 < d < b["grab_distance_m"]
-            if still_there:
+            py = self.yolo.bear_pixel_y()
+            visible = self.yolo.bear_visible()
+            held_in_claw = (
+                visible
+                and 0 < d <= b.get("verify_held_depth_m", 0.7)
+                and py <= b.get("verify_held_pixel_y_max", 360.0)
+            )
+            still_close = visible and 0 < d < b["grab_distance_m"] and not held_in_claw
+
+            if held_in_claw:
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] grasp OK — bear visible in claw zone "
+                    f"(d={d:.2f}m py={py:.0f}) → return"
+                )
+                self._goto(next_state)
+            elif still_close and b.get("verify_retry_on_ground", False):
                 self._grab_retries += 1
                 if self._grab_retries > b["grab_retry_max"]:
                     self._fail(f"grab failed {self._grab_retries}× — bear still at {d:.2f}m")
                     return
                 self.get_logger().warn(
-                    f"[GRASP_RAMP_BEAR] bear still at {d:.2f}m — retry {self._grab_retries}/{b['grab_retry_max']}"
+                    f"[GRASP_RAMP_BEAR] bear still at d={d:.2f}m py={py:.0f} "
+                    f"— retry {self._grab_retries}/{b['grab_retry_max']}"
                 )
                 self._phase_goto(0)
             else:
-                self.get_logger().info(f"[GRASP_RAMP_BEAR] grasp OK (d={d:.2f}m) → return")
+                if still_close:
+                    self.get_logger().warn(
+                        f"[GRASP_RAMP_BEAR] bear still close (d={d:.2f}m py={py:.0f}), "
+                        "but auto-retry is disabled so the gripper will not open again → return"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"[GRASP_RAMP_BEAR] grasp OK "
+                        f"(visible={visible} d={d:.2f}m py={py:.0f}) → return"
+                    )
                 self._goto(next_state)
 
     # ------------------------------------------------------------------
     # Return / drop
     # ------------------------------------------------------------------
 
+    def _select_return_exit_mode(self):
+        """Choose how to leave the bridge before routing home.
+
+        Horizontal bridge: robot yaw is near ±180° after the grab; reverse down
+        the bridge first. Vertical bridge: yaw is near +90°; drive forward down
+        the bridge first. Fall back to the outbound orientation flag when yaw is
+        not close to either expected heading.
+        """
+        cfg = self.cfg["return"]
+        if self.pose is None:
+            return "horizontal" if self._bridge_horizontal else "vertical"
+
+        yaw = self.pose[2]
+        horizontal_err = abs(_norm_ang(yaw - math.pi))
+        vertical_err = abs(_norm_ang(yaw - math.pi / 2.0))
+        threshold = math.radians(cfg.get("bridge_yaw_select_threshold_deg", 55.0))
+
+        if horizontal_err <= vertical_err and horizontal_err <= threshold:
+            return "horizontal"
+        if vertical_err < horizontal_err and vertical_err <= threshold:
+            return "vertical"
+        return "horizontal" if self._bridge_horizontal else "vertical"
+
     def _state_return_origin(self, next_state):
         r = self.cfg["return"]
         elapsed = time.monotonic() - self._phase_t0
 
-        if self._phase == 0:
+        if self._phase == 0:       # first leave the bridge, then route home
+            if not self._require_pose():
+                return
+            if self._anchor is None:
+                self._anchor = self.pose[:2]
+                self._return_exit_mode = self._select_return_exit_mode()
+                self.get_logger().info(
+                    f"[RETURN] bridge exit mode={self._return_exit_mode} "
+                    f"yaw={math.degrees(self.pose[2]):.0f}°"
+                )
+
+            if self._return_exit_mode == "horizontal":
+                target = r["horizontal_reverse_m"]
+                speed = -r["bridge_exit_speed"]
+                action = "BACKWARD"
+            else:
+                target = r["vertical_forward_m"]
+                speed = r["bridge_exit_speed"]
+                action = "FORWARD"
+
+            travelled = self._dist_from_anchor()
+            if travelled >= target:
+                self.car.stop()
+                self.get_logger().info(
+                    f"[RETURN] bridge exit complete ({travelled:.2f}/{target:.2f}m) → origin route"
+                )
+                self._phase_goto(1)
+                return
+
+            self.car.publish_velocities(speed, speed)
+            self.get_logger().info(
+                f"[RETURN] bridge exit {action} {travelled:.2f}/{target:.2f}m"
+            )
+
+        elif self._phase == 1:     # route to origin after clearing the bridge
             if not self._require_pose():
                 return
             if self._drive_to_point(self.cfg["route"]["origin"]):
                 if r["drop_at_origin"]:
-                    self._phase_goto(1)
+                    self._phase_goto(2)
                 else:
                     self.get_logger().info(
                         "[RETURN] at origin — holding bear (drop_at_origin=false)"
                     )
                     self._goto(next_state)
 
-        elif self._phase == 1:     # drop
+        elif self._phase == 2:     # drop
             if not self._phase_entered:
                 self._phase_entered = True
                 self.get_logger().info("[RETURN] dropping bear at origin")
                 self.arm.open_gripper()
             self.car.stop()
             if elapsed > r["drop_wait_seconds"]:
-                self._phase_goto(2)
+                self._phase_goto(3)
 
-        elif self._phase == 2:     # back away and stow
+        elif self._phase == 3:     # back away and stow
             self.car.publish_velocities(
                 -self.cfg["control"]["slow_speed"], -self.cfg["control"]["slow_speed"]
             )
