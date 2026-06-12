@@ -48,30 +48,30 @@ route:
   # to the short chain; exhausting both fails. yaw is radians (from the measured
   # quaternion; yaw_deg kept in the comment for reference).
   long_side_observe:   # car faces ≈ -x, scanning the ramp from the long side
-    - x: 3.190980385005133
+    - x: 3.1
       y: 2.3993529864074534
-      yaw: -3.028112     # yaw_deg -173.50
+      yaw: -3.14    # yaw_deg -173.50
       tolerance: 0.25
-    - x: 3.1673200657656966
+    - x: 3.1
       y: 1.5115117995190306
-      yaw: -3.122549     # yaw_deg -178.91
+      yaw: -3.14     # yaw_deg -178.91
       tolerance: 0.25
-    - x: 2.986569637545023
-      y: 1.0410239171932514
-      yaw: -3.119820     # yaw_deg -178.75
+    - x: 3.1
+      y: 0.9010239171932514
+      yaw: -3.14     # yaw_deg -178.75
       tolerance: 0.25
   short_side_observe:  # car faces ≈ +y, scanning the ramp from the short side
     - x: 1.8089964857296893
       y: -0.04615138122065065
-      yaw: 1.556845      # yaw_deg 89.21
+      yaw: 1.57      # yaw_deg 89.21
       tolerance: 0.25
-    - x: 1.384922645232404
+    - x: 1.54922645232404
       y: -0.17849396546502885
-      yaw: 1.687163      # yaw_deg 96.66
+      yaw: 1.57     # yaw_deg 96.66
       tolerance: 0.25
-    - x: 0.9429347816558855
+    - x: 0.89347816558855
       y: -0.11186797965906972
-      yaw: 1.713559      # yaw_deg 98.17
+      yaw: 1.57      # yaw_deg 98.17
       tolerance: 0.25
   long_to_short_corner:  # Perimeter corner between the long and short observe chains.
     # Going straight from the long chain's last point to the short chain's first
@@ -90,8 +90,8 @@ route:
 control:
   fast_speed: 700.0
   medium_speed: 450.0      # used for route legs
-  slow_speed: 300.0        # used for visual servo / final approach
-  turn_speed: 400.0
+  slow_speed: 400.0        # used for visual servo / final approach
+  turn_speed: 300.0
   turn_slow_speed: 300.0   # near-target rotation; 150 stalls in-place turns in Unity, 250 works
   turn_slowdown_deg: 20.0  # yaw error below this → rotate at turn_slow_speed (anti-overshoot)
   yaw_tolerance_deg: 3.0   # turn-in-place completion threshold, in DEGREES (plain number — YAML can't eval math.radians())
@@ -221,8 +221,14 @@ ramp:
   # "bridge is horizontal" flag. Tune against the去程 log if it under/over-fires.
   outbound_area_threshold: 0.01
   outbound_required_frames: 2
-  scan_seconds: 5.0         # max time scanning per observation side
+  scan_seconds: 3.0         # max time scanning per observation side
   center_threshold_px: 50.0
+  # RAMP_ALIGN_BOTTOM (runs once after a scan confirms the ramp, before the
+  # approach): visual-servo the ramp mask's near edge down to the frame bottom.
+  # /yolo/bridge_info[4] reports that edge as y/(h-1): 0=top, 1=frame bottom.
+  align_bottom_target_ratio: 0.95   # edge ≥ this counts as aligned to the bottom
+  align_speed: 120.0                 # forward creep speed while closing the gap
+  align_timeout_s: 15.0              # ramp not reacquired this long → go to approach anyway
   approach_speed: 120.0
   approach_done_area: 0.15   # ramp fills this much of bottom half → close enough, classify bears
   approach_timeout_s: 30.0
@@ -235,33 +241,70 @@ bear:
   blocking_area_threshold: 0.05
   classify_observe_seconds: 1.5
   align_threshold_px: 50.0
+  # Lowers the published /clicked_point target below the bear marker so the
+  # gripper descends from above (top-down grab). Applied on this (mission) side;
+  # arm_controller_2D's own offset is 0.0. Larger = gripper aims lower; 0.0 =
+  # aim straight at the marker. Tune on flat ground with get_bear first.
+  grab_z_offset_m: 0.0
+  # Auto-grab starts only when the bear is freshly visible, centered within
+  # align_threshold_px, and strictly closer than this depth.
   grab_distance_m: 0.4
-  # Seconds to wait after triggering the auto_arm_human IK grab (/arm_auto_grab)
-  # before backing up to verify. The grab runs in arm_controller_2D's background
+  # Once inside grab_distance_m, keep pushing forward briefly instead of
+  # stopping on the ramp face. This prevents the car from holding a standoff,
+  # sliding backward, then re-servoing forever.
+  grab_commit_forward_seconds: 0.8
+  grab_commit_forward_speed: 220.0
+  # 0 = stop fully before/while the arm grabs. Was 120 (a forward creep to fight
+  # gravity pulling the chassis back on the ramp), but the IK target is sampled
+  # ONCE at trigger from the YOLO marker, then the car kept creeping for the full
+  # grab_wait_seconds (~12s) — so the bear's real position drifted away from the
+  # locked target and the arm reached for a stale/too-far X (the 0.18m > 0.191m
+  # max-reach miss). Stopping removes that motion-vs-stale-depth inconsistency.
+  # CAVEAT: if the car now back-slides on the ramp during the grab, restore a
+  # small value (e.g. 60) rather than the old 120.
+  grab_hold_forward_speed: 0.0
+  grab_info_stale_s: 0.7
+  # Safe arm precondition before publishing target_point/clicked_point to auto_arm.
+  # Direct /robot_arm degrees, calibrated from /robot_arm echo:
+  # [0.0, 141.0, 90.0] = raised claw pose that avoids sweeping through the bear.
+  safe_pre_arm_pose_deg: [0.0, 141.0, 90.0]
+  pre_arm_settle_s: 0.5
+  # Seconds to wait after triggering the auto_arm_human IK grab (/clicked_point)
+  # before depth-probe verification. The grab runs in arm_controller_2D's background
   # thread (open → IK approach → close → retract); too short drops the bear before
   # the gripper closes. Matches get_bear_node's grab_wait_seconds. TUNE to the rig.
   grab_wait_seconds: 12.0
-  servo_timeout_s: 20.0      # bear lost during servo for this long → FAILED
-  # Do not auto-retry ramp-bear grabs by default. The auto-arm sequence opens the
-  # gripper first; if the first grab already succeeded and the bear is visible in
-  # front of the camera, a retry drops it.
-  verify_retry_on_ground: false
+  servo_timeout_s: 600.0      # bear lost during servo for this long → FAILED
+  # Auto-retry only after the depth-probe check proves the bear did not move with
+  # the claw. This avoids dropping a successfully-held bear while preventing a
+  # ground bear from being accepted as success.
+  verify_retry_on_ground: true
   grab_retry_max: 2          # used only when verify_retry_on_ground=true
-  verify_held_depth_m: 0.7
-  verify_held_pixel_y_max: 360.0
-  verify_backup_seconds: 0.5
+  # Grasp verification: record bear depth, back up a little, then require fresh
+  # /yolo/bear_info depth to stay nearly unchanged. A held bear moves with the
+  # car/camera; a ground bear's depth changes by roughly the probe distance.
+  verify_baseline_observe_seconds: 0.3
+  verify_probe_distance_m: 0.12
+  verify_probe_min_distance_m: 0.06
+  verify_probe_speed: 220.0
+  verify_probe_timeout_s: 0.7
+  verify_restore_timeout_s: 0.7
   verify_observe_seconds: 0.8
+  verify_info_stale_s: 0.7
+  verify_arm_depth_threshold: 0.35
+  verify_depth_min_frames: 1
+  verify_depth_stable_tolerance_m: 0.05
   clear_backward_seconds: 1.0
   clear_rotate_seconds: 1.2
 
 return:
   # Before driving home, leave the bridge/ramp in the safe direction:
-  #   horizontal bridge (yaw near ±180°) → reverse 1.0 m down the bridge
-  #   vertical bridge (yaw near +90°)   → drive forward 1.5 m down the bridge
+  #   horizontal / long-side bridge (yaw near ±180°) → drive forward 1.0 m
+  #   vertical / short-side bridge (yaw near +90°)   → reverse 1.5 m
   bridge_yaw_select_threshold_deg: 55.0
   bridge_exit_speed: 300.0
-  horizontal_reverse_m: 1.0
-  vertical_forward_m: 1.5
+  horizontal_forward_m: 1.0
+  vertical_reverse_m: 1.5
   drop_at_origin: true       # false = hold the bear at origin until task trigger
   drop_wait_seconds: 2.0
   back_away_seconds: 1.0

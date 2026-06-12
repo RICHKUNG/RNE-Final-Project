@@ -12,6 +12,8 @@ class YoloClient:
         self._bridge_seq = 0
         self._bridge_mono = None
         self._bear_info = None
+        self._bear_seq = 0
+        self._bear_mono = None
         self._knob_info = None
 
         node.create_subscription(Float32MultiArray, "/yolo/target_info", self._info_cb, 10)
@@ -33,6 +35,8 @@ class YoloClient:
 
     def _bear_cb(self, msg):
         self._bear_info = list(msg.data)
+        self._bear_seq += 1
+        self._bear_mono = time.monotonic()
 
     def _knob_cb(self, msg):
         self._knob_info = list(msg.data)
@@ -69,7 +73,9 @@ class YoloClient:
     # The seg model now detects the ramp face; data still arrives on the
     # legacy /yolo/bridge_info topic.  New publishers send:
     # [legacy_bottom_found, dx, bottom_area_ratio, full_area_ratio].
-    # New ramp code should use these names.
+    # New ramp code should use these names.  data[4] (when present) is the ramp
+    # mask's lowest row as a fraction of image height: 0.0 = top of frame,
+    # 1.0 = the near edge reaches the bottom of the frame.
 
     def ramp_topic_alive(self):
         return self._bridge_info is not None
@@ -96,6 +102,11 @@ class YoloClient:
     def ramp_full_area_ratio(self):
         return self._bridge_info[3] if self._bridge_info and len(self._bridge_info) >= 4 else 0.0
 
+    def ramp_bottom_edge_ratio(self):
+        """Ramp mask's lowest row, normalised to image height (0=top, 1=frame
+        bottom). 0.0 when the publisher predates this field (4-field message)."""
+        return self._bridge_info[4] if self._bridge_info and len(self._bridge_info) >= 5 else 0.0
+
     def ramp_area_ratio(self):
         # New ramp publishers append full-frame mask area at index 3.  Keep old
         # three-field messages usable by falling back to the legacy bottom-half
@@ -103,10 +114,16 @@ class YoloClient:
         return max(self.ramp_bottom_area_ratio(), self.ramp_full_area_ratio())
 
     # ── bear_info accessors ───────────────────────────────────────────
-    # /yolo/bear_info: [found, distance, delta_x, pixel_x, pixel_y]
+    # /yolo/bear_info: [found, distance, delta_x, pixel_x, pixel_y, on_ramp]
 
     def bear_topic_alive(self):
         return self._bear_info is not None
+
+    def bear_seq(self):
+        return self._bear_seq
+
+    def bear_age_s(self):
+        return time.monotonic() - self._bear_mono if self._bear_mono is not None else None
 
     def bear_visible(self):
         return self._bear_info is not None and len(self._bear_info) >= 1 and self._bear_info[0] == 1.0
@@ -119,6 +136,10 @@ class YoloClient:
 
     def bear_pixel_y(self):
         return self._bear_info[4] if self._bear_info and len(self._bear_info) >= 5 else 0.0
+
+    def bear_on_ramp(self):
+        """1.0 on ramp, 0.0 blocking, -1.0 unknown (no ramp mask / old detector)."""
+        return self._bear_info[5] if self._bear_info and len(self._bear_info) >= 6 else -1.0
 
     # ── knob_info accessors ───────────────────────────────────────────
     # /yolo/knob_info: [found, distance, delta_x, pixel_x, pixel_y, area, conf]

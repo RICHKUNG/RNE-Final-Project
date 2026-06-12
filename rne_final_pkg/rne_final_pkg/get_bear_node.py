@@ -7,6 +7,7 @@ SEARCH_SPIN   rotate until a bear is detected outside the home ignore zone
 LOCALIZE      backproject bear pixel → map coords, send Nav2 goal
 NAV_TO_BEAR   follow Nav2 plan to stop_dist in front of bear
 VISUAL_SERVO  close-range centering + approach
+PRE_ARM       move arm to safe pre-grab pose before publishing target
 GRAB          publish /clicked_point to trigger arm grab
 GRAB_WAIT     timed wait for arm_controller_2D background thread to finish
 VERIFY_GRASP  back up, count YOLO frames to confirm pick-up succeeded
@@ -36,6 +37,7 @@ from ament_index_python.packages import get_package_share_directory
 import yaml
 
 from rne_final_pkg.car_driver import CarDriver
+from rne_final_pkg.arm_driver import SAFE_PRE_ARM_POSE
 from rne_final_pkg.nav_client import NavClient
 
 # Only linear commands can reveal a stuck-against-wall condition via position tracking.
@@ -43,7 +45,16 @@ from rne_final_pkg.nav_client import NavClient
 _LINEAR_ACTIONS = frozenset({"FORWARD", "FORWARD_SLOW", "BACKWARD", "BACKWARD_SLOW"})
 
 # States where stuck detection must not run (already recovering, or car is stopped by design).
-_NO_STUCK_CHECK = frozenset({"RECOVERY", "BRIDGE_AVOID", "DONE", "GRAB", "GRAB_WAIT", "DROP", "LOCALIZE"})
+_NO_STUCK_CHECK = frozenset({
+    "RECOVERY",
+    "BRIDGE_AVOID",
+    "DONE",
+    "PRE_ARM",
+    "GRAB",
+    "GRAB_WAIT",
+    "DROP",
+    "LOCALIZE",
+})
 
 
 class GetBearNode(Node):
@@ -200,6 +211,19 @@ class GetBearNode(Node):
         )
         self.destroy_timer(self._stow_timer)
 
+    def _publish_safe_pre_arm_pose(self):
+        angles_deg = self.params.get("safe_pre_arm_pose_deg")
+        positions = (
+            [math.radians(float(a)) for a in angles_deg]
+            if angles_deg is not None
+            else list(SAFE_PRE_ARM_POSE)
+        )
+
+        msg = JointTrajectoryPoint()
+        msg.positions = positions
+        msg.velocities = [0.0] * len(positions)
+        self._arm_pub.publish(msg)
+
     # ------------------------------------------------------------------
     # Subscriptions
     # ------------------------------------------------------------------
@@ -315,6 +339,8 @@ class GetBearNode(Node):
             self._state_nav_to_bear()
         elif s == "VISUAL_SERVO":
             self._state_visual_servo()
+        elif s == "PRE_ARM":
+            self._state_pre_arm()
         elif s == "GRAB":
             self._state_grab()
         elif s == "GRAB_WAIT":
@@ -555,7 +581,7 @@ class GetBearNode(Node):
         elif dx < -rotate_th:
             action = "COUNTERCLOCKWISE_ROTATION_SLOW"
         elif 0 < dist < grab_th:
-            action = "→ GRAB"
+            action = "→ PRE_ARM"
         else:
             action = "FORWARD_SLOW"
 
@@ -564,11 +590,30 @@ class GetBearNode(Node):
             f"(rotate_th=±{rotate_th:.0f}  grab_th={grab_th:.2f}m) → {action}"
         )
 
-        if action == "→ GRAB":
+        if action == "→ PRE_ARM":
             self._stop()
-            self._goto("GRAB")
+            self._goto("PRE_ARM")
         else:
             self._drive(action)
+
+    # ------------------------------------------------------------------
+    # PRE_ARM — raise arm before sending target to auto_arm
+    # ------------------------------------------------------------------
+
+    def _state_pre_arm(self):
+        self._stop()
+        settle_s = self.params.get("pre_arm_settle_seconds", 0.5)
+
+        if self._state_start is None:
+            self._state_start = time.time()
+            self._publish_safe_pre_arm_pose()
+            self.get_logger().info(
+                f"[PRE_ARM] Published SAFE_PRE_ARM_POSE; waiting {settle_s:.1f}s"
+            )
+            return
+
+        if time.time() - self._state_start >= settle_s:
+            self._goto("GRAB")
 
     # ------------------------------------------------------------------
     # GRAB — set arm target + trigger grab, then hand off to GRAB_WAIT
@@ -583,12 +628,16 @@ class GetBearNode(Node):
             return
 
         bear_x, bear_y = self._bear_map_pos
+        # Lower the target below ground level so the gripper descends from above
+        # (top-down grab). arm_controller_2D applies no offset of its own, so this
+        # is the single source of the grab z-offset for get_bear.
+        z_offset = self.params.get("grab_z_offset_m", 0.04)
         pt = PointStamped()
         pt.header.frame_id = "map"
         pt.header.stamp = self.get_clock().now().to_msg()
         pt.point.x = float(bear_x)
         pt.point.y = float(bear_y)
-        pt.point.z = 0.0
+        pt.point.z = -float(z_offset)
         self._clicked_point_pub.publish(pt)
         self.get_logger().info(
             f"[GRAB] Published /clicked_point  map=({bear_x:.2f}, {bear_y:.2f})"

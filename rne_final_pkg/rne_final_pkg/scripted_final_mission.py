@@ -64,6 +64,7 @@ class S(Enum):
     MOVE_TO_LONG_SHORT_CORNER = auto()   # perimeter corner: avoid diagonal over the bridge
     MOVE_TO_RAMP_OBSERVE_SHORT_SIDE = auto()
     RAMP_SCAN_SHORT_SIDE = auto()
+    RAMP_ALIGN_BOTTOM = auto()           # servo near edge of ramp mask to the frame bottom
     RAMP_APPROACH = auto()
     RAMP_BEAR_CLASSIFY = auto()
     CLEAR_BLOCKING_BEAR = auto()
@@ -146,6 +147,15 @@ class ScriptedFinalMission(Node):
         self._classify_entries = 0
         self._classify_samples = []
         self._grab_retries = 0
+        self._auto_grab_triggered = False
+        self._auto_grab_t0 = None
+        self._auto_grab_marker = None
+        self._bear_commit_t0 = None
+        self._grasp_verify_depth0 = None
+        self._grasp_verify_seq0 = None
+        self._grasp_verify_samples = []
+        self._grasp_verify_last_seq = None
+        self._grasp_verify_probe_m = 0.0
         self._return_exit_mode = None
         self._press_attempts = 0
         self._knob_invalid_t0 = None
@@ -273,6 +283,15 @@ class ScriptedFinalMission(Node):
         self._servo_settle_t0 = None
         self._stuck_anchor = None
         self._return_exit_mode = None
+        self._grasp_verify_depth0 = None
+        self._grasp_verify_seq0 = None
+        self._grasp_verify_samples = []
+        self._grasp_verify_last_seq = None
+        self._grasp_verify_probe_m = 0.0
+        self._auto_grab_triggered = False
+        self._auto_grab_t0 = None
+        self._auto_grab_marker = None
+        self._bear_commit_t0 = None
 
     def _phase_goto(self, phase: int):
         self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
@@ -280,6 +299,10 @@ class ScriptedFinalMission(Node):
         self._phase_t0 = time.monotonic()
         self._phase_entered = False
         self._anchor = self.pose[:2] if self.pose else None
+        self._auto_grab_triggered = False
+        self._auto_grab_t0 = None
+        self._auto_grab_marker = None
+        self._bear_commit_t0 = None
 
     def _fail(self, reason: str):
         self._fail_reason = reason
@@ -339,7 +362,7 @@ class ScriptedFinalMission(Node):
         elif s == S.RAMP_SCAN_LONG_SIDE:
             self._state_ramp_scan(self.cfg["route"]["long_side_observe"],
                                   move_state=S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE,
-                                  found_next=S.RAMP_APPROACH,
+                                  found_next=S.RAMP_ALIGN_BOTTOM,
                                   exhausted_next=S.MOVE_TO_LONG_SHORT_CORNER)
         elif s == S.MOVE_TO_LONG_SHORT_CORNER:
             # Route around the outer perimeter instead of diagonally across the
@@ -353,8 +376,10 @@ class ScriptedFinalMission(Node):
         elif s == S.RAMP_SCAN_SHORT_SIDE:
             self._state_ramp_scan(self.cfg["route"]["short_side_observe"],
                                   move_state=S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE,
-                                  found_next=S.RAMP_APPROACH,
+                                  found_next=S.RAMP_ALIGN_BOTTOM,
                                   exhausted_next=None)
+        elif s == S.RAMP_ALIGN_BOTTOM:
+            self._state_ramp_align_bottom(S.RAMP_APPROACH)
         elif s == S.RAMP_APPROACH:
             self._state_ramp_approach(S.RAMP_BEAR_CLASSIFY)
         elif s == S.RAMP_BEAR_CLASSIFY:
@@ -977,6 +1002,53 @@ class ScriptedFinalMission(Node):
             else:
                 self._fail("ramp not found from any observation point")
 
+    def _state_ramp_align_bottom(self, next_state):
+        """Visual servo the ramp mask's near edge down to the bottom of the
+        camera frame before the approach. Center on the ramp (dx) first, then
+        creep forward until the published bottom-edge ratio reaches the target;
+        getting closer pushes the near edge lower in the frame. On timeout,
+        proceed to the approach anyway rather than failing — the approach has
+        its own search/forward logic."""
+        c = self.cfg["ramp"]
+        slow = self.cfg["control"]["turn_slow_speed"]
+        elapsed = time.monotonic() - self._state_t0
+
+        if not self.yolo.ramp_visible():
+            if elapsed > c["align_timeout_s"]:
+                self.get_logger().warn(
+                    f"[RAMP_ALIGN_BOTTOM] ramp not reacquired in {elapsed:.0f}s → {next_state.name}"
+                )
+                self.car.stop()
+                self._goto(next_state)
+                return
+            self.get_logger().info(f"[RAMP_ALIGN_BOTTOM] ramp lost ({elapsed:.1f}s) → rotate CW search")
+            self.car.publish_velocities(slow, -slow)
+            return
+
+        dx = self.yolo.ramp_delta_x()
+        edge = self.yolo.ramp_bottom_edge_ratio()
+
+        if abs(dx) > c["center_threshold_px"]:
+            self.get_logger().info(
+                f"[RAMP_ALIGN_BOTTOM] dx={dx:.0f}px edge={edge:.2f} → rotate to center"
+            )
+            self._rotate_dir(-dx, speed=slow)
+            return
+
+        if edge < c["align_bottom_target_ratio"]:
+            self.get_logger().info(
+                f"[RAMP_ALIGN_BOTTOM] edge={edge:.2f} < {c['align_bottom_target_ratio']} → forward"
+            )
+            v = c["align_speed"]
+            self.car.publish_velocities(v, v)
+            return
+
+        self.get_logger().info(
+            f"[RAMP_ALIGN_BOTTOM] near edge at frame bottom (edge={edge:.2f}) → {next_state.name}"
+        )
+        self.car.stop()
+        self._goto(next_state)
+
     def _state_ramp_approach(self, next_state):
         c = self.cfg["ramp"]
         b = self.cfg["bear"]
@@ -1036,7 +1108,8 @@ class ScriptedFinalMission(Node):
 
         if self.yolo.bear_visible():
             self._classify_samples.append(
-                (self.yolo.bear_distance(), self.yolo.bear_pixel_y())
+                (self.yolo.bear_distance(), self.yolo.bear_pixel_y(),
+                 self.yolo.bear_on_ramp())
             )
 
         elapsed = time.monotonic() - self._phase_t0
@@ -1057,15 +1130,112 @@ class ScriptedFinalMission(Node):
         n = len(self._classify_samples)
         avg_d = sum(s[0] for s in self._classify_samples) / n
         avg_py = sum(s[1] for s in self._classify_samples) / n
-        blocking = (
-            avg_py > b["blocking_pixel_y_threshold"]
-            and avg_d < b["blocking_depth_threshold_m"]
-        )
+
+        # Prefer the seg/det relation (bear bbox vs ramp mask) when the detector
+        # reports it: on_ramp==1 → ramp bear, ==0 → blocking. Fall back to the
+        # depth/pixel_y heuristic only when every sample is unknown (-1), e.g. no
+        # ramp mask in view or an old detector without the on_ramp field.
+        ramp_votes = [s[2] for s in self._classify_samples if s[2] >= 0.0]
+        if ramp_votes:
+            on_ramp = sum(ramp_votes) / len(ramp_votes) >= 0.5
+            blocking = not on_ramp
+            basis = f"on_ramp_votes={len(ramp_votes)}/{n} mean={sum(ramp_votes)/len(ramp_votes):.2f}"
+        else:
+            blocking = (
+                avg_py > b["blocking_pixel_y_threshold"]
+                and avg_d < b["blocking_depth_threshold_m"]
+            )
+            basis = f"fallback depth={avg_d:.2f}m pixel_y={avg_py:.0f}"
         self.get_logger().info(
-            f"[CLASSIFY] n={n}  avg_depth={avg_d:.2f}m  avg_pixel_y={avg_py:.0f}  "
+            f"[CLASSIFY] n={n}  {basis}  "
             f"→ {'BLOCKING_BEAR' if blocking else 'RAMP_BEAR'}"
         )
         self._goto(S.CLEAR_BLOCKING_BEAR if blocking else S.GRASP_RAMP_BEAR)
+
+    def _bear_grab_ready(self):
+        b = self.cfg["bear"]
+        age = self.yolo.bear_age_s()
+        visible = self.yolo.bear_visible()
+        d = self.yolo.bear_distance()
+        dx = self.yolo.bear_delta_x()
+        fresh = age is not None and age <= b.get("grab_info_stale_s", 0.7)
+        ready = (
+            visible
+            and fresh
+            and math.isfinite(d)
+            and 0.0 < d < b["grab_distance_m"]
+            and abs(dx) <= b["align_threshold_px"]
+        )
+        return ready, d, dx, age
+
+    def _target_marker_ready(self):
+        marker = self.yolo.marker()
+        if marker is None:
+            return False, None
+        add_action = getattr(marker, "ADD", 0)
+        if marker.action != add_action:
+            return False, marker
+        return True, marker
+
+    def _auto_grab_precondition_step(self, label: str):
+        b = self.cfg["bear"]
+        settle_s = b.get("pre_arm_settle_s", 0.5)
+        hold_speed = b.get("grab_hold_forward_speed", 0.0)
+
+        if not self._phase_entered:
+            ready, d, dx, age = self._bear_grab_ready()
+            marker_ok, marker = self._target_marker_ready()
+            if not ready or not marker_ok:
+                age_text = "none" if age is None else f"{age:.2f}s"
+                marker_state = "ok" if marker_ok else "missing/delete"
+                self.get_logger().warn(
+                    f"[{label}] grab gate rejected "
+                    f"(visible={self.yolo.bear_visible()} d={d:.2f}m "
+                    f"dx={dx:.0f}px age={age_text} marker={marker_state}) → re-servo"
+                )
+                self._phase_goto(0)
+                return False
+
+            self._phase_entered = True
+            self._auto_grab_triggered = False
+            self._auto_grab_t0 = None
+            self._auto_grab_marker = None
+            if hold_speed > 0.0:
+                self.car.publish_velocities(hold_speed, hold_speed)
+            else:
+                self.car.stop()
+            self.arm.safe_pre_arm_pose(b.get("safe_pre_arm_pose_deg"))
+            self.get_logger().info(
+                f"[{label}] SAFE_PRE_ARM_POSE → wait {settle_s:.1f}s, "
+                f"then publish target_point and trigger auto_arm "
+                f"(d={d:.2f}m dx={dx:.0f}px frame={marker.header.frame_id})"
+            )
+            return False
+
+        if not self._auto_grab_triggered:
+            if hold_speed > 0.0:
+                self.car.publish_velocities(hold_speed, hold_speed)
+            else:
+                self.car.stop()
+            if time.monotonic() - self._phase_t0 < settle_s:
+                return False
+            marker_ok, marker = self._target_marker_ready()
+            if not marker_ok:
+                self.get_logger().warn(
+                    f"[{label}] target marker missing at trigger → re-servo"
+                )
+                self._phase_goto(0)
+                return False
+            self._auto_grab_marker = marker
+            self.arm.auto_grab_marker(marker, b.get("grab_z_offset_m", 0.0))
+            self._auto_grab_triggered = True
+            self._auto_grab_t0 = time.monotonic()
+            self.get_logger().info(f"[{label}] published target_point via /clicked_point")
+            return False
+
+        if hold_speed > 0.0:
+            self.car.publish_velocities(hold_speed, hold_speed)
+        return True
 
     def _bear_servo_step(self) -> bool:
         """Align + close on the bear; True when at grab distance.
@@ -1080,7 +1250,20 @@ class ScriptedFinalMission(Node):
             return False
 
         if not self.yolo.bear_visible():
-            self.get_logger().info(f"[{self._state.name}] bear lost ({elapsed:.1f}s) → rotate CW search")
+            self._bear_commit_t0 = None
+            self.get_logger().info(
+                f"[{self._state.name}] bear lost ({elapsed:.1f}s) → rotate CW search"
+            )
+            self.car.publish_velocities(turn, -turn)
+            return False
+
+        age = self.yolo.bear_age_s()
+        if age is None or age > b.get("grab_info_stale_s", 0.7):
+            self._bear_commit_t0 = None
+            age_text = "none" if age is None else f"{age:.2f}s"
+            self.get_logger().info(
+                f"[{self._state.name}] bear info stale (age={age_text}) → rotate CW search"
+            )
             self.car.publish_velocities(turn, -turn)
             return False
 
@@ -1088,12 +1271,31 @@ class ScriptedFinalMission(Node):
         d = self.yolo.bear_distance()
 
         if abs(dx) > b["align_threshold_px"]:
+            self._bear_commit_t0 = None
             self.get_logger().info(f"[{self._state.name}] dx={dx:.0f}px d={d:.2f}m → rotate")
             self._rotate_dir(-dx, speed=turn)
             return False
-        if 0 < d <= b["grab_distance_m"]:
+        if 0 < d < b["grab_distance_m"]:
+            commit_s = b.get("grab_commit_forward_seconds", 0.0)
+            if commit_s > 0.0:
+                if self._bear_commit_t0 is None:
+                    self._bear_commit_t0 = time.monotonic()
+                    self.get_logger().info(
+                        f"[{self._state.name}] grab range d={d:.2f}m -> "
+                        f"commit forward {commit_s:.1f}s"
+                    )
+                commit_elapsed = time.monotonic() - self._bear_commit_t0
+                if commit_elapsed < commit_s:
+                    v = b.get("grab_commit_forward_speed", slow)
+                    self.car.publish_velocities(v, v)
+                    self.get_logger().info(
+                        f"[{self._state.name}] commit forward "
+                        f"{commit_elapsed:.1f}/{commit_s:.1f}s d={d:.2f}m"
+                    )
+                    return False
             self.car.stop()
             return True
+        self._bear_commit_t0 = None
         self.get_logger().info(f"[{self._state.name}] aligned d={d:.2f}m → forward slow")
         self.car.publish_velocities(slow, slow)
         return False
@@ -1106,13 +1308,13 @@ class ScriptedFinalMission(Node):
             if self._bear_servo_step():
                 self._phase_goto(1)
 
-        elif self._phase == 1:     # grab — calibrated auto_arm_human IK grab (async)
-            if not self._phase_entered:
-                self._phase_entered = True
-                self.car.stop()
-                self.get_logger().info("[CLEAR_BEAR] trigger auto-arm IK grab")
-                self.arm.auto_grab()
-            if elapsed > b["grab_wait_seconds"]:
+        elif self._phase == 1:     # pre-arm, target_point, auto-arm grab (async)
+            if self._auto_grab_precondition_step("CLEAR_BEAR"):
+                elapsed_after_trigger = time.monotonic() - self._auto_grab_t0
+            else:
+                return
+
+            if elapsed_after_trigger > b["grab_wait_seconds"]:
                 self._phase_goto(2)
 
         elif self._phase == 2:     # back away from the ramp entrance
@@ -1148,6 +1350,37 @@ class ScriptedFinalMission(Node):
                 self.get_logger().info("[CLEAR_BEAR] cleared → back to ramp approach")
                 self._goto(next_state)
 
+    def _fresh_bear_depth(self):
+        b = self.cfg["bear"]
+        age = self.yolo.bear_age_s()
+        visible = self.yolo.bear_visible()
+        d = self.yolo.bear_distance()
+        py = self.yolo.bear_pixel_y()
+        seq = self.yolo.bear_seq()
+        fresh = age is not None and age <= b.get("verify_info_stale_s", 0.7)
+        valid = visible and fresh and math.isfinite(d) and d > 0.0
+        return valid, seq, d, py, age
+
+    def _retry_grasp_or_fail(self, reason: str, restore_probe: bool):
+        b = self.cfg["bear"]
+        if not b.get("verify_retry_on_ground", True):
+            self._fail(f"grab verify failed — {reason}")
+            return
+
+        self._grab_retries += 1
+        max_retries = int(b.get("grab_retry_max", 2))
+        if self._grab_retries > max_retries:
+            self._fail(
+                f"grab failed after {self._grab_retries} failed verifies — {reason}"
+            )
+            return
+
+        self.get_logger().warn(
+            f"[GRASP_RAMP_BEAR] {reason} — retry "
+            f"{self._grab_retries}/{max_retries}"
+        )
+        self._phase_goto(5 if restore_probe else 0)
+
     def _state_grasp_ramp_bear(self, next_state):
         b = self.cfg["bear"]
         elapsed = time.monotonic() - self._phase_t0
@@ -1156,65 +1389,156 @@ class ScriptedFinalMission(Node):
             if self._bear_servo_step():
                 self._phase_goto(1)
 
-        elif self._phase == 1:     # grab — calibrated auto_arm_human IK grab (async)
-            if not self._phase_entered:
-                self._phase_entered = True
-                self.car.stop()
-                self.get_logger().info("[GRASP_RAMP_BEAR] trigger auto-arm IK grab")
-                self.arm.auto_grab()
-            if elapsed > b["grab_wait_seconds"]:
+        elif self._phase == 1:     # pre-arm, target_point, auto-arm grab (async)
+            if self._auto_grab_precondition_step("GRASP_RAMP_BEAR"):
+                elapsed_after_trigger = time.monotonic() - self._auto_grab_t0
+            else:
+                return
+
+            if elapsed_after_trigger > b["grab_wait_seconds"]:
                 self._phase_goto(2)
 
-        elif self._phase == 2:     # verify: back up briefly
-            self.car.publish_velocities(
-                -self.cfg["control"]["slow_speed"], -self.cfg["control"]["slow_speed"]
-            )
-            if elapsed > b["verify_backup_seconds"]:
-                self.car.stop()
-                self._phase_goto(3)
-
-        elif self._phase == 3:     # verify: observe
+        elif self._phase == 2:     # verify: capture depth before a small probe move
             self.car.stop()
+            if not self._phase_entered:
+                self._phase_entered = True
+                self._grasp_verify_depth0 = None
+                self._grasp_verify_seq0 = None
+                self._grasp_verify_samples = []
+                self._grasp_verify_last_seq = None
+                self._grasp_verify_probe_m = 0.0
+                self.get_logger().info("[GRASP_RAMP_BEAR] verify depth baseline")
+
+            if elapsed < b.get("verify_baseline_observe_seconds", 0.3):
+                return
+
+            valid, seq, d, py, age = self._fresh_bear_depth()
+            if not valid:
+                age_text = "none" if age is None else f"{age:.2f}s"
+                self._retry_grasp_or_fail(
+                    f"no valid bear depth before probe "
+                    f"(visible={self.yolo.bear_visible()} d={d:.2f}m age={age_text})",
+                    restore_probe=False,
+                )
+                return
+
+            self._grasp_verify_depth0 = d
+            self._grasp_verify_seq0 = seq
+            self.get_logger().info(
+                f"[GRASP_RAMP_BEAR] baseline d={d:.2f}m py={py:.0f} seq={seq} "
+                "→ small BACKWARD probe"
+            )
+            self._phase_goto(3)
+
+        elif self._phase == 3:     # verify: move a short distance on the bridge
+            target = b.get("verify_probe_distance_m", 0.12)
+            speed = b.get("verify_probe_speed", self.cfg["control"]["slow_speed"])
+            timeout = b.get("verify_probe_timeout_s", b.get("verify_backup_seconds", 0.5))
+            travelled = self._dist_from_anchor()
+            if travelled >= target or elapsed > timeout:
+                self.car.stop()
+                self._grasp_verify_probe_m = travelled
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] probe done {travelled:.2f}/{target:.2f}m "
+                    "→ observe depth change"
+                )
+                self._phase_goto(4)
+                return
+
+            self.car.publish_velocities(-speed, -speed)
+            self.get_logger().info(
+                f"[GRASP_RAMP_BEAR] probe BACKWARD {travelled:.2f}/{target:.2f}m"
+            )
+
+        elif self._phase == 4:     # verify: compare fresh depth after the probe
+            self.car.stop()
+            if not self._phase_entered:
+                self._phase_entered = True
+                self._grasp_verify_samples = []
+                self._grasp_verify_last_seq = None
+
+            valid, seq, d, py, _age = self._fresh_bear_depth()
+            if (
+                valid
+                and self._grasp_verify_seq0 is not None
+                and seq > self._grasp_verify_seq0
+                and seq != self._grasp_verify_last_seq
+            ):
+                self._grasp_verify_samples.append((d, py, seq))
+                self._grasp_verify_last_seq = seq
+
             if elapsed < b["verify_observe_seconds"]:
                 return
-            d = self.yolo.bear_distance()
-            py = self.yolo.bear_pixel_y()
-            visible = self.yolo.bear_visible()
-            held_in_claw = (
-                visible
-                and 0 < d <= b.get("verify_held_depth_m", 0.7)
-                and py <= b.get("verify_held_pixel_y_max", 360.0)
-            )
-            still_close = visible and 0 < d < b["grab_distance_m"] and not held_in_claw
 
-            if held_in_claw:
-                self.get_logger().info(
-                    f"[GRASP_RAMP_BEAR] grasp OK — bear visible in claw zone "
-                    f"(d={d:.2f}m py={py:.0f}) → return"
+            min_probe = b.get("verify_probe_min_distance_m", 0.06)
+            if self._pose_ok() and self._grasp_verify_probe_m < min_probe:
+                self._retry_grasp_or_fail(
+                    f"probe movement too small "
+                    f"({self._grasp_verify_probe_m:.2f}m < {min_probe:.2f}m)",
+                    restore_probe=True,
                 )
+                return
+
+            min_frames = int(b.get("verify_depth_min_frames", 1))
+            if len(self._grasp_verify_samples) < min_frames:
+                self._retry_grasp_or_fail(
+                    f"not enough fresh depth samples after probe "
+                    f"({len(self._grasp_verify_samples)}/{min_frames})",
+                    restore_probe=True,
+                )
+                return
+
+            depth0 = self._grasp_verify_depth0
+            avg_d = sum(sample[0] for sample in self._grasp_verify_samples) / len(
+                self._grasp_verify_samples
+            )
+            avg_py = sum(sample[1] for sample in self._grasp_verify_samples) / len(
+                self._grasp_verify_samples
+            )
+            delta = abs(avg_d - depth0)
+            tolerance = b.get("verify_depth_stable_tolerance_m", 0.05)
+            arm_depth_th = b.get("verify_arm_depth_threshold", 0.35)
+
+            if delta <= tolerance and avg_d < arm_depth_th:
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] grasp OK — depth stable after probe "
+                    f"(d0={depth0:.2f}m d1={avg_d:.2f}m Δ={delta:.2f}m "
+                    f"py={avg_py:.0f}) → return"
+                )
+                self._grab_retries = 0
                 self._goto(next_state)
-            elif still_close and b.get("verify_retry_on_ground", False):
-                self._grab_retries += 1
-                if self._grab_retries > b["grab_retry_max"]:
-                    self._fail(f"grab failed {self._grab_retries}× — bear still at {d:.2f}m")
-                    return
-                self.get_logger().warn(
-                    f"[GRASP_RAMP_BEAR] bear still at d={d:.2f}m py={py:.0f} "
-                    f"— retry {self._grab_retries}/{b['grab_retry_max']}"
+            elif delta <= tolerance:
+                self._retry_grasp_or_fail(
+                    f"depth stable but not in arm range "
+                    f"(d1={avg_d:.2f}m >= {arm_depth_th:.2f}m)",
+                    restore_probe=True,
+                )
+            else:
+                self._retry_grasp_or_fail(
+                    f"depth changed after probe "
+                    f"(d0={depth0:.2f}m d1={avg_d:.2f}m Δ={delta:.2f}m "
+                    f"> {tolerance:.2f}m)",
+                    restore_probe=True,
+                )
+
+        elif self._phase == 5:     # retry only: return to the pre-probe grasp pose
+            target = b.get("verify_probe_distance_m", 0.12)
+            speed = b.get("verify_probe_speed", self.cfg["control"]["slow_speed"])
+            timeout = b.get("verify_restore_timeout_s", b.get("verify_probe_timeout_s", 0.5))
+            travelled = self._dist_from_anchor()
+            if travelled >= target or elapsed > timeout:
+                self.car.stop()
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] probe restored {travelled:.2f}/{target:.2f}m "
+                    "→ retry servo"
                 )
                 self._phase_goto(0)
-            else:
-                if still_close:
-                    self.get_logger().warn(
-                        f"[GRASP_RAMP_BEAR] bear still close (d={d:.2f}m py={py:.0f}), "
-                        "but auto-retry is disabled so the gripper will not open again → return"
-                    )
-                else:
-                    self.get_logger().info(
-                        f"[GRASP_RAMP_BEAR] grasp OK "
-                        f"(visible={visible} d={d:.2f}m py={py:.0f}) → return"
-                    )
-                self._goto(next_state)
+                return
+
+            self.car.publish_velocities(speed, speed)
+            self.get_logger().info(
+                f"[GRASP_RAMP_BEAR] restore FORWARD {travelled:.2f}/{target:.2f}m"
+            )
 
     # ------------------------------------------------------------------
     # Return / drop
@@ -1223,8 +1547,8 @@ class ScriptedFinalMission(Node):
     def _select_return_exit_mode(self):
         """Choose how to leave the bridge before routing home.
 
-        Horizontal bridge: robot yaw is near ±180° after the grab; reverse down
-        the bridge first. Vertical bridge: yaw is near +90°; drive forward down
+        Horizontal bridge: robot yaw is near ±180° after the grab; drive forward
+        down the bridge first. Vertical bridge: yaw is near +90°; reverse down
         the bridge first. Fall back to the outbound orientation flag when yaw is
         not close to either expected heading.
         """
@@ -1259,13 +1583,13 @@ class ScriptedFinalMission(Node):
                 )
 
             if self._return_exit_mode == "horizontal":
-                target = r["horizontal_reverse_m"]
-                speed = -r["bridge_exit_speed"]
-                action = "BACKWARD"
-            else:
-                target = r["vertical_forward_m"]
+                target = r.get("horizontal_forward_m", r.get("horizontal_reverse_m", 1.0))
                 speed = r["bridge_exit_speed"]
                 action = "FORWARD"
+            else:
+                target = r.get("vertical_reverse_m", r.get("vertical_forward_m", 1.5))
+                speed = -r["bridge_exit_speed"]
+                action = "BACKWARD"
 
             travelled = self._dist_from_anchor()
             if travelled >= target:

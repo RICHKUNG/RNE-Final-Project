@@ -27,8 +27,20 @@ plan_forward_angle_deg: 20.0
 # Pixel offset from center that triggers a rotation command during visual servo.
 visual_servo_rotate_threshold_px: 50.0
 
-# Depth (meters) at which visual servo stops and grab begins.
-grab_distance_threshold: 0.4
+# Depth (meters) at which visual servo stops and pre-arm/grab begins.
+grab_distance_threshold: 0.35
+
+# Lowers the published /clicked_point target below the bear so the gripper
+# descends from above (top-down grab). Applied on this (mission) side;
+# arm_controller_2D's own offset is 0.0. Larger = aims lower; 0.0 = at marker.
+# Tune this on flat ground first.
+grab_z_offset_m: 0.04
+
+# Safe arm precondition before publishing /clicked_point to auto_arm.
+# Direct /robot_arm degrees, calibrated from /robot_arm echo:
+# [0.0, 141.0, 90.0] = raised claw pose that avoids sweeping through the bear.
+safe_pre_arm_pose_deg: [0.0, 141.0, 90.0]
+pre_arm_settle_seconds: 0.5
 
 # TF frame of the depth camera (Z-axis forward / optical convention).
 camera_frame: "camera_optical_frame"
