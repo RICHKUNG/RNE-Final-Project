@@ -95,8 +95,18 @@ door_press:
   # Change those two together or the swing misses the knob.
   forward_before_press_m: 0.20
   forward_during_press_m: 0.12
-  push_after_unlock_m: 0.35
-  push_speed: 120.0
+  # Straight-line displacement of the arc push. Door opening angle ≈
+  # 2*asin(d / (2*door_width)) — the old 0.47 m total only opened ~35°,
+  # not wide enough for the success judge. TODO TUNE until the judge accepts.
+  push_after_unlock_m: 0.75
+  push_speed: 120.0          # straight segments: pre-press forward, retry backup
+  # Arc push toward front-right while the claw holds the knob down. Hinge is
+  # on the RIGHT (facing the door), handle on the LEFT, so the handle sweeps
+  # front-right as the door swings open — the arc follows it. If the car turns
+  # too sharply and slides off the door, raise push_speed_right toward
+  # push_speed_left. TODO TUNE the ratio in Unity.
+  push_speed_left: 150.0
+  push_speed_right: 90.0
   retry_count: 0             # extra unconditional re-presses; door opens first try
   exit_wait_s: 1.0           # hold at route.door_exit_point after the door opens
   # Calibrated 2026-06-12 from /robot_arm echo (3 joints; arm_writer leaves the
@@ -108,7 +118,8 @@ door_press:
   # knob fully down. Placeholder — joint0 deepened past 57°, not yet calibrated.
   arm_press_low_deg: [80.0, 141.0, 90.0]
   arm_settle_s: 1.2          # wait after each arm command
-  phase_timeout_s: 6.0       # per-phase watchdog: pose-distance phases give up after this
+  phase_timeout_s: 10.0      # per-phase watchdog: pose-distance phases give up
+                             # after this (sized for the long arc push)
 
 ramp:
   # Reference only — the model is loaded by yolo_example_pkg/object_detect.py from its

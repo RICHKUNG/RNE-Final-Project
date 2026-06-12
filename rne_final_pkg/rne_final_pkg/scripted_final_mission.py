@@ -564,7 +564,8 @@ class ScriptedFinalMission(Node):
 
         Flow: raise claw in place → blind forward forward_before_press_m →
         swing down to the calibrated hit pose → continue through to the low
-        pose (drives the knob fully down) → push the door open.
+        pose (drives the knob fully down) → arc push toward front-right,
+        claw still on the knob, following the door's swing.
         """
         c = self.cfg["door_press"]
         elapsed = time.monotonic() - self._phase_t0
@@ -606,8 +607,10 @@ class ScriptedFinalMission(Node):
             if elapsed > c["arm_settle_s"]:
                 self._phase_goto(4)
 
-        elif self._phase == 4:     # push door forward while pressing
-            self.car.publish_velocities(c["push_speed"], c["push_speed"])
+        elif self._phase == 4:     # arc push toward front-right, claw still on the knob
+            # Differential speeds (left > right) follow the door's swing arc
+            # instead of pushing straight into the door edge.
+            self.car.publish_velocities(c["push_speed_left"], c["push_speed_right"])
             target = c["forward_during_press_m"] + c["push_after_unlock_m"]
             if self._commit_forward_done(target):
                 self.car.stop()
