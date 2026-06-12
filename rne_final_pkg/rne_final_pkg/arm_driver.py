@@ -1,6 +1,7 @@
 import math
 import time
 from trajectory_msgs.msg import JointTrajectoryPoint
+from std_msgs.msg import Bool
 
 # Joint index reference
 # 0: base rotation  0–180°
@@ -35,6 +36,10 @@ class ArmDriver:
     def __init__(self, node):
         self._node = node
         self._pub = node.create_publisher(JointTrajectoryPoint, "robot_arm", 10)
+        # Trigger for the calibrated auto_arm_human IK grab (arm_controller_2D).
+        # Publishing Bool True is the same hook get_bear_node uses via /clicked_point
+        # — see arm_controller_2D._auto_grab_cb / main2.on_clicked_point_grab.
+        self._auto_grab_pub = node.create_publisher(Bool, "/arm_auto_grab", 10)
         self._joint_pos = list(RESET_POS)
 
     def _publish(self):
@@ -67,6 +72,19 @@ class ArmDriver:
     def set_angles_deg(self, *angles_deg):
         self._joint_pos = _deg(*angles_deg)
         self._publish()
+
+    def auto_grab(self):
+        """Trigger the calibrated auto_arm_human IK grab on the latest bear.
+
+        Publishes Bool True to /arm_auto_grab; arm_controller_2D (the AutoArmMode /
+        robot_control node) transforms /yolo/target_marker into the arm base frame,
+        runs 2D IK and executes the full open→approach→close→retract sequence in a
+        background thread (~several seconds — caller must wait, see bear.grab_wait_seconds).
+
+        This is the same proven path get_bear_node uses, replacing the untuned
+        fixed-angle grab_sequence() below.
+        """
+        self._auto_grab_pub.publish(Bool(data=True))
 
     def grab_sequence(self, x_target=0.15, z_target=0.05):
         """

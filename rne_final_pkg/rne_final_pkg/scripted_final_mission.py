@@ -75,6 +75,16 @@ class S(Enum):
 
 
 class ScriptedFinalMission(Node):
+    # States allowed past safety.sea_x_limit: the door (and door_exit_point
+    # ~x=3.56) sit behind the wall in the +x sea region, so the push and the
+    # post-push reverse legitimately operate there. Everywhere else, x past the
+    # limit is drift toward the sea and the guard escapes it.
+    _SEA_EXEMPT = frozenset({
+        S.TASK3_DOOR_PRESS_COMMIT,
+        S.TASK3_TURN_FORWARD,
+        S.BACK_UP_AFTER_TASK3,
+    })
+
     def __init__(self, node_name="scripted_final_mission"):
         super().__init__(node_name)
 
@@ -125,6 +135,11 @@ class ScriptedFinalMission(Node):
         self._ramp_last_seq = None   # last counted seg message (see yolo_client.ramp_seq)
         self._observe_idx = 0        # index into the current side's observe chain
                                      # (survives MOVE→SCAN→MOVE; reset only on side switch)
+        self._bridge_horizontal = False  # set if the ramp is seen on the outbound
+                                     # leg (SEGMENT_1): bridge lies horizontal, so the
+                                     # post-door route skips the long side and goes
+                                     # straight to the short-side observe chain.
+                                     # Persists across _goto (not reset there).
         self._approach_done = False  # ramp approach reached approach_done_area at least once
         self._classify_entries = 0
         self._classify_samples = []
@@ -137,6 +152,9 @@ class ScriptedFinalMission(Node):
         # stuck detection while driving forward (route legs)
         self._stuck_anchor = None    # (x, y, monotonic) of last confirmed movement
         self._recover_until = 0.0    # while monotonic < this, back up instead of driving
+
+        # sea guard: True while actively escaping the +x sea edge (see _sea_guard)
+        self._sea_escaping = False
 
         self.create_timer(0.1, self._tick)   # 10 Hz control loop
         self.get_logger().info(f"{self.get_name()} ready — waiting for pose + YOLO topics (INIT)")
@@ -264,12 +282,16 @@ class ScriptedFinalMission(Node):
 
     def _tick(self):
         self._update_pose()
+        if self._sea_guard():
+            return
         s = self._state
 
         if s == S.INIT:
             self._state_init()
         elif s == S.TASK3_ROUTE_SEGMENT_1:
-            self._state_route(self.cfg["route"]["turn_point"], S.TASK3_TURN_LEFT)
+            # Outbound leg doubles as a ramp pre-check (watch_ramp): seeing the
+            # ramp here means the bridge is horizontal → skip the long side later.
+            self._state_route(self.cfg["route"]["turn_point"], S.TASK3_TURN_LEFT, watch_ramp=True)
         elif s == S.TASK3_TURN_LEFT:
             # left 90° from the measured heading at turn_point — not a hardcoded yaw
             target = _norm_ang(self.cfg["route"]["turn_point"]["yaw"] + math.pi / 2.0)
@@ -286,13 +308,24 @@ class ScriptedFinalMission(Node):
             self._state_door_press(S.TASK3_TURN_FORWARD)
         elif s == S.TASK3_TURN_FORWARD:
             # The arc push leaves the car yawed off; rotate back to face forward
-            # (map +x, yaw=0) before reversing for the ramp search.
-            self._state_turn_to(0.0, S.BACK_UP_AFTER_TASK3)
+            # (map +x, yaw=0) before reversing for the ramp search. Watchdog so a
+            # car still jammed on the door doesn't spin here forever.
+            self._state_turn_to(
+                0.0, S.BACK_UP_AFTER_TASK3,
+                timeout_s=self.cfg["post_task3"]["turn_forward_timeout_s"],
+            )
         elif s == S.BACK_UP_AFTER_TASK3:
+            # Bridge known horizontal from the outbound leg → skip long-side
+            # observe and route right-angle (via long_to_short_corner, the outer
+            # perimeter) straight to the short-side observe chain.
+            after_backup = (
+                S.MOVE_TO_LONG_SHORT_CORNER if self._bridge_horizontal
+                else S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE
+            )
             self._state_back_up(
                 self.cfg["post_task3"]["backup_distance_m"],
                 self.cfg["post_task3"]["backup_speed"],
-                S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE,
+                after_backup,
             )
         elif s == S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE:
             self._state_move_observe(self.cfg["route"]["long_side_observe"], S.RAMP_SCAN_LONG_SIDE)
@@ -437,6 +470,48 @@ class ScriptedFinalMission(Node):
         )
         return False
 
+    def _sea_guard(self) -> bool:
+        """Keep the car out of the +x sea. Returns True when the guard is driving
+        (caller must skip the normal state this tick).
+
+        A blind reverse is unsafe: depending on yaw it can back the car *further*
+        into the sea. Instead, turn to face -x (away from the +x sea) and drive
+        forward, which reduces x regardless of the starting heading, until x is
+        below (limit − sea_clear_margin). Door states are exempt (see _SEA_EXEMPT).
+        """
+        cfg = self.cfg.get("safety") or {}
+        limit = cfg.get("sea_x_limit")
+        if limit is None or self._state in self._SEA_EXEMPT or not self._pose_ok():
+            self._sea_escaping = False
+            return False
+
+        x, _, _ = self.pose
+        margin = cfg.get("sea_clear_margin", 0.15)
+
+        if not self._sea_escaping:
+            if x <= limit:
+                return False
+            self._sea_escaping = True
+            self.get_logger().error(
+                f"[SEA_GUARD] x={x:.2f} > {limit} (sea) in {self._state.name} "
+                f"— turning to face -x and escaping"
+            )
+        elif x <= limit - margin:
+            self._sea_escaping = False
+            self.car.stop()
+            self.get_logger().warn(
+                f"[SEA_GUARD] cleared (x={x:.2f}) — resuming {self._state.name}"
+            )
+            return True   # settle this tick; the state runs again next tick
+
+        # Face -x (map west, away from the +x sea), then drive forward to cut x.
+        if not self._turn_to_yaw(math.pi):
+            return True   # still rotating toward -x
+        self.car.publish_velocities(
+            self.cfg["control"]["slow_speed"], self.cfg["control"]["slow_speed"]
+        )
+        return True
+
     # ------------------------------------------------------------------
     # INIT
     # ------------------------------------------------------------------
@@ -475,14 +550,47 @@ class ScriptedFinalMission(Node):
     # Task 3 — route, knob servo, door press
     # ------------------------------------------------------------------
 
-    def _state_route(self, wp, next_state):
+    def _accumulate_ramp_hits(self, area_threshold=None) -> int:
+        """Fold this side's confirmed ramp seg inferences into _ramp_window and
+        return the running hit count. Counts distinct seg messages only (seg
+        publishes ~1 Hz while this loop ticks at 10 Hz, so a sticky message must
+        not accumulate repeat hits). Shared by SEGMENT_1's flag check and the
+        ramp scan states; area_threshold defaults to the close-range
+        found_area_threshold, overridden looser for the far outbound pre-check."""
+        c = self.cfg["ramp"]
+        thr = area_threshold if area_threshold is not None else c["found_area_threshold"]
+        seq = self.yolo.ramp_seq()
+        if self._ramp_last_seq is None:
+            self._ramp_last_seq = seq
+        elif seq != self._ramp_last_seq:
+            self._ramp_last_seq = seq
+            found = self.yolo.ramp_visible() and self.yolo.ramp_area_ratio() > thr
+            self._ramp_window.append(1 if found else 0)
+        return sum(self._ramp_window)
+
+    def _state_route(self, wp, next_state, watch_ramp=False):
         if not self._require_pose():
             return
+        if watch_ramp and not self._bridge_horizontal:
+            # Outbound leg: if the ramp is already in view here the bridge lies
+            # horizontal — flag it so the post-door route skips the long side.
+            # Looser thresholds (outbound_*) since the ramp is far and small here.
+            r = self.cfg["ramp"]
+            if self._accumulate_ramp_hits(r["outbound_area_threshold"]) >= r["outbound_required_frames"]:
+                self._bridge_horizontal = True
+                self.get_logger().info(
+                    "[SEGMENT_1] ramp seen on the outbound leg → bridge is HORIZONTAL; "
+                    "post-door route will skip the long side and go straight to the short side"
+                )
         if self._drive_to_point(wp):
             self._goto(next_state)
 
-    def _state_turn_to(self, target_yaw, next_state):
-        """Turn in place to an absolute map-frame yaw (from route config)."""
+    def _state_turn_to(self, target_yaw, next_state, timeout_s=None):
+        """Turn in place to an absolute map-frame yaw (from route config).
+
+        timeout_s (optional): give up and advance after this long instead of
+        spinning forever if the car can't reach the heading (e.g. still jammed
+        on the door). None = no watchdog (route turns must complete)."""
         if not self._require_pose():
             return
         if self._anchor is None:
@@ -491,6 +599,13 @@ class ScriptedFinalMission(Node):
                 f"[{self._state.name}] target yaw={math.degrees(self._anchor):.0f}°"
             )
         if self._turn_to_yaw(self._anchor):
+            self._goto(next_state)
+        elif timeout_s is not None and time.monotonic() - self._state_t0 > timeout_s:
+            self.get_logger().warn(
+                f"[{self._state.name}] turn watchdog ({timeout_s:.0f}s) — "
+                "could not reach heading; advancing anyway"
+            )
+            self.car.stop()
             self._goto(next_state)
 
     # Knob source indirection — door_test overrides these to fall back to
@@ -693,8 +808,15 @@ class ScriptedFinalMission(Node):
             # Differential speeds (left > right) follow the door's swing arc
             # instead of pushing straight into the door edge.
             self.car.publish_velocities(c["push_speed_left"], c["push_speed_right"])
+            # TIME-bounded, not distance-bounded. The claw pins the door, so the
+            # base barely translates (door resists + wheels skid) and pose distance
+            # never reaches push_after_unlock_m — the old _commit_forward_done() ran
+            # every time to the 13 s phase watchdog, shoving the door far past 90°.
+            # Door angle = push_speed × push_seconds now; calibrate push_seconds.
+            # Distance still ends it early if the base ever does travel the target
+            # (e.g. door already swung free), as a sanity cap.
             target = c["forward_during_press_m"] + c["push_after_unlock_m"]
-            if self._commit_forward_done(target):
+            if elapsed >= c["push_seconds"] or self._commit_forward_done(target):
                 self.car.stop()
                 self._press_attempts += 1
                 if self._press_attempts <= c["retry_count"]:
@@ -784,18 +906,7 @@ class ScriptedFinalMission(Node):
         self.car.stop()
         idx = self._observe_idx
 
-        # Count distinct seg inferences only — seg publishes ~1 Hz while this
-        # loop ticks at 10 Hz, so re-reading the same sticky message must not
-        # accumulate hits.  Messages from before this state entered are skipped.
-        seq = self.yolo.ramp_seq()
-        if self._ramp_last_seq is None:
-            self._ramp_last_seq = seq
-        elif seq != self._ramp_last_seq:
-            self._ramp_last_seq = seq
-            found = self.yolo.ramp_visible() and self.yolo.ramp_area_ratio() > c["found_area_threshold"]
-            self._ramp_window.append(1 if found else 0)
-
-        hits = sum(self._ramp_window)
+        hits = self._accumulate_ramp_hits()
         elapsed = time.monotonic() - self._state_t0
 
         self.get_logger().info(
@@ -957,10 +1068,14 @@ class ScriptedFinalMission(Node):
             if self._bear_servo_step():
                 self._phase_goto(1)
 
-        elif self._phase == 1:     # grab (blocking helper, ~4.5 s)
-            self.get_logger().info("[CLEAR_BEAR] grab sequence")
-            self.arm.grab_sequence()
-            self._phase_goto(2)
+        elif self._phase == 1:     # grab — calibrated auto_arm_human IK grab (async)
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.car.stop()
+                self.get_logger().info("[CLEAR_BEAR] trigger auto-arm IK grab")
+                self.arm.auto_grab()
+            if elapsed > b["grab_wait_seconds"]:
+                self._phase_goto(2)
 
         elif self._phase == 2:     # back away from the ramp entrance
             self.car.publish_velocities(
@@ -1003,10 +1118,14 @@ class ScriptedFinalMission(Node):
             if self._bear_servo_step():
                 self._phase_goto(1)
 
-        elif self._phase == 1:     # grab
-            self.get_logger().info("[GRASP_RAMP_BEAR] grab sequence")
-            self.arm.grab_sequence()
-            self._phase_goto(2)
+        elif self._phase == 1:     # grab — calibrated auto_arm_human IK grab (async)
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.car.stop()
+                self.get_logger().info("[GRASP_RAMP_BEAR] trigger auto-arm IK grab")
+                self.arm.auto_grab()
+            if elapsed > b["grab_wait_seconds"]:
+                self._phase_goto(2)
 
         elif self._phase == 2:     # verify: back up briefly
             self.car.publish_velocities(
