@@ -57,6 +57,7 @@ class S(Enum):
     TASK3_KNOB_SERVO = auto()
     TASK3_DOOR_PRESS_COMMIT = auto()
     TASK3_DOOR_EXIT_WAIT = auto()        # hold just past the door for exit_wait_s
+    BACK_UP_AFTER_TASK3 = auto()         # reverse a fixed distance before ramp search
 
     MOVE_TO_RAMP_OBSERVE_LONG_SIDE = auto()
     RAMP_SCAN_LONG_SIDE = auto()
@@ -121,12 +122,16 @@ class ScriptedFinalMission(Node):
 
         self._ramp_window = deque(maxlen=int(self.cfg["ramp"]["found_window_frames"]))
         self._ramp_last_seq = None   # last counted seg message (see yolo_client.ramp_seq)
+        self._observe_idx = 0        # index into the current side's observe chain
+                                     # (survives MOVE→SCAN→MOVE; reset only on side switch)
         self._approach_done = False  # ramp approach reached approach_done_area at least once
         self._classify_entries = 0
         self._classify_samples = []
         self._grab_retries = 0
         self._press_attempts = 0
         self._knob_invalid_t0 = None
+        self._servo_settle_t0 = None     # knob servo: in-window settle timer
+        self._press_commit_depth = None  # depth at servo commit → dynamic forward leg
 
         # stuck detection while driving forward (route legs)
         self._stuck_anchor = None    # (x, y, monotonic) of last confirmed movement
@@ -240,6 +245,7 @@ class ScriptedFinalMission(Node):
         self._ramp_last_seq = None
         self._classify_samples = []
         self._knob_invalid_t0 = None
+        self._servo_settle_t0 = None
         self._stuck_anchor = None
 
     def _phase_goto(self, phase: int):
@@ -278,16 +284,27 @@ class ScriptedFinalMission(Node):
         elif s == S.TASK3_DOOR_PRESS_COMMIT:
             self._state_door_press(S.TASK3_DOOR_EXIT_WAIT)
         elif s == S.TASK3_DOOR_EXIT_WAIT:
-            self._state_door_exit_wait(S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE)
+            self._state_door_exit_wait(S.BACK_UP_AFTER_TASK3)
+        elif s == S.BACK_UP_AFTER_TASK3:
+            self._state_back_up(
+                self.cfg["post_task3"]["backup_distance_m"],
+                self.cfg["post_task3"]["backup_speed"],
+                S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE,
+            )
         elif s == S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE:
             self._state_move_observe(self.cfg["route"]["long_side_observe"], S.RAMP_SCAN_LONG_SIDE)
         elif s == S.RAMP_SCAN_LONG_SIDE:
-            self._state_ramp_scan(found_next=S.RAMP_APPROACH,
-                                  not_found_next=S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE)
+            self._state_ramp_scan(self.cfg["route"]["long_side_observe"],
+                                  move_state=S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE,
+                                  found_next=S.RAMP_APPROACH,
+                                  exhausted_next=S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE)
         elif s == S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE:
             self._state_move_observe(self.cfg["route"]["short_side_observe"], S.RAMP_SCAN_SHORT_SIDE)
         elif s == S.RAMP_SCAN_SHORT_SIDE:
-            self._state_ramp_scan(found_next=S.RAMP_APPROACH, not_found_next=None)
+            self._state_ramp_scan(self.cfg["route"]["short_side_observe"],
+                                  move_state=S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE,
+                                  found_next=S.RAMP_APPROACH,
+                                  exhausted_next=None)
         elif s == S.RAMP_APPROACH:
             self._state_ramp_approach(S.RAMP_BEAR_CLASSIFY)
         elif s == S.RAMP_BEAR_CLASSIFY:
@@ -490,6 +507,7 @@ class ScriptedFinalMission(Node):
 
         if not self._knob_visible():
             self._knob_invalid_t0 = None
+            self._servo_settle_t0 = None
             self.get_logger().info(f"[KNOB_SERVO] no knob ({elapsed:.1f}s) → rotate CW search")
             self.car.publish_velocities(turn, -turn)
             return
@@ -499,6 +517,7 @@ class ScriptedFinalMission(Node):
 
         if abs(dx) > c["center_threshold_px"]:
             self._knob_invalid_t0 = None
+            self._servo_settle_t0 = None
             self.get_logger().info(f"[KNOB_SERVO] dx={dx:.0f}px depth={depth:.2f}m → rotate")
             self._rotate_dir(-dx, speed=turn)   # dx>0 = knob right of center → CW
             return
@@ -506,6 +525,7 @@ class ScriptedFinalMission(Node):
         # centered — close in on depth
         if depth <= 0:
             now = time.monotonic()
+            self._servo_settle_t0 = None
             if self._knob_invalid_t0 is None:
                 self._knob_invalid_t0 = now
             self.car.stop()
@@ -517,6 +537,7 @@ class ScriptedFinalMission(Node):
         self._knob_invalid_t0 = None
 
         if depth > c["target_depth_m"]:
+            self._servo_settle_t0 = None
             self.get_logger().info(
                 f"[KNOB_SERVO] centered dx={dx:.0f}px  depth={depth:.2f}m > {c['target_depth_m']}m → FORWARD_SLOW"
             )
@@ -526,6 +547,7 @@ class ScriptedFinalMission(Node):
         # Too close — the press pose is calibrated at target_depth_m, so back
         # up until depth is inside [target - tol, target] before committing.
         if depth < c["target_depth_m"] - c["depth_tolerance_m"]:
+            self._servo_settle_t0 = None
             self.get_logger().info(
                 f"[KNOB_SERVO] centered dx={dx:.0f}px  depth={depth:.2f}m < "
                 f"{c['target_depth_m'] - c['depth_tolerance_m']:.2f}m → BACKWARD_SLOW"
@@ -533,10 +555,25 @@ class ScriptedFinalMission(Node):
             self.car.publish_velocities(-slow, -slow)
             return
 
-        self.get_logger().info(
-            f"[KNOB_SERVO] aligned  dx={dx:.0f}px  depth={depth:.2f}m → commit (camera goes blind now)"
-        )
+        # In the window — stop and settle before committing: the depth message
+        # lags the camera and the car coasts after stop, so the first in-window
+        # reading can be a few cm stale (occasional press overshoot).
         self.car.stop()
+        now = time.monotonic()
+        if self._servo_settle_t0 is None:
+            self._servo_settle_t0 = now
+            self.get_logger().info(
+                f"[KNOB_SERVO] in window  dx={dx:.0f}px  depth={depth:.2f}m → settling"
+            )
+            return
+        if now - self._servo_settle_t0 < c["commit_settle_s"]:
+            return
+
+        self.get_logger().info(
+            f"[KNOB_SERVO] aligned  dx={dx:.0f}px  depth={depth:.2f}m (settled) "
+            "→ commit (camera goes blind now)"
+        )
+        self._press_commit_depth = depth
         self._press_attempts = 0
         self._goto(next_state)
 
@@ -562,10 +599,11 @@ class ScriptedFinalMission(Node):
     def _state_door_press(self, next_state):
         """Scripted open-loop commit — no knob vision from here on.
 
-        Flow: raise claw in place → blind forward forward_before_press_m →
-        swing down to the calibrated hit pose → continue through to the low
-        pose (drives the knob fully down) → arc push toward front-right,
-        claw still on the knob, following the door's swing.
+        Flow: raise claw in place → forward (servo commit depth −
+        press_standoff_m) → swing down to the calibrated hit pose → continue
+        through to the low pose (full unlock) → back to the hold pose so the
+        handle stays pressed (top/bottom rod lock re-engages if released) →
+        arc push toward front-right following the door's swing.
         """
         c = self.cfg["door_press"]
         elapsed = time.monotonic() - self._phase_t0
@@ -579,9 +617,28 @@ class ScriptedFinalMission(Node):
             if elapsed > c["arm_settle_s"]:
                 self._phase_goto(1)
 
-        elif self._phase == 1:     # blind forward commit to the press standoff
+        elif self._phase == 1:     # forward from the servo stop to press range
+            if not self._phase_entered:
+                self._phase_entered = True
+                if self._press_commit_depth is not None:
+                    # Dynamic leg: actual measured gap at commit − standoff,
+                    # instead of a fixed 0.20 that assumes the servo stopped
+                    # exactly at target_depth_m.
+                    self._press_forward_m = max(
+                        self._press_commit_depth - c["press_standoff_m"], 0.0
+                    )
+                    self.get_logger().info(
+                        f"[DOOR_PRESS] forward {self._press_forward_m:.2f}m "
+                        f"(commit depth {self._press_commit_depth:.2f}m − "
+                        f"standoff {c['press_standoff_m']:.2f}m)"
+                    )
+                else:  # debug jump straight into DOOR_PRESS — no servo depth
+                    self._press_forward_m = c["forward_before_press_m"]
+                    self.get_logger().info(
+                        f"[DOOR_PRESS] forward {self._press_forward_m:.2f}m (fixed fallback)"
+                    )
             self.car.publish_velocities(c["push_speed"], c["push_speed"])
-            if self._commit_forward_done(c["forward_before_press_m"]):
+            if self._commit_forward_done(self._press_forward_m):
                 self.car.stop()
                 self._phase_goto(2)
 
@@ -607,7 +664,22 @@ class ScriptedFinalMission(Node):
             if elapsed > c["arm_settle_s"]:
                 self._phase_goto(4)
 
-        elif self._phase == 4:     # arc push toward front-right, claw still on the knob
+        elif self._phase == 4:     # re-seat on the handle for the push
+            if not self._phase_entered:
+                self._phase_entered = True
+                # The door has a top/bottom rod lock: the handle must STAY
+                # pressed while the door moves or it re-locks at a small
+                # angle. The low pose slides off the handle once the car
+                # starts moving — hold at the hit-pose height instead.
+                self.get_logger().info(
+                    f"[DOOR_PRESS] hold handle for push: {c['arm_push_hold_deg']}"
+                )
+                self.arm.set_angles_deg(*c["arm_push_hold_deg"])
+            self.car.stop()
+            if elapsed > c["arm_settle_s"]:
+                self._phase_goto(5)
+
+        elif self._phase == 5:     # arc push toward front-right, claw holding the handle
             # Differential speeds (left > right) follow the door's swing arc
             # instead of pushing straight into the door edge.
             self.car.publish_velocities(c["push_speed_left"], c["push_speed_right"])
@@ -621,26 +693,26 @@ class ScriptedFinalMission(Node):
                     self.get_logger().warn(
                         "[DOOR_PRESS] scripted retry — raise arm, back up, re-press"
                     )
-                    self._phase_goto(5)
+                    self._phase_goto(6)
                 else:
-                    self._phase_goto(7)
+                    self._phase_goto(8)
 
-        elif self._phase == 5:     # retry: raise the claw before reversing so it
+        elif self._phase == 6:     # retry: raise the claw before reversing so it
             if not self._phase_entered:   # doesn't drag across the knob/door
                 self._phase_entered = True
                 self.arm.set_angles_deg(*c["arm_raise_deg"])
             self.car.stop()
             if elapsed > c["arm_settle_s"]:
-                self._phase_goto(6)
+                self._phase_goto(7)
 
-        elif self._phase == 6:     # retry: back up the push distance, then re-press
+        elif self._phase == 7:     # retry: back up the push distance, then re-press
             self.car.publish_velocities(-c["push_speed"], -c["push_speed"])
             target = c["forward_during_press_m"] + c["push_after_unlock_m"]
             if self._commit_forward_done(target):
                 self.car.stop()
                 self._phase_goto(2)
 
-        elif self._phase == 7:     # retract arm and finish
+        elif self._phase == 8:     # retract arm and finish
             if not self._phase_entered:
                 self._phase_entered = True
                 self.get_logger().info("[DOOR_PRESS] retract arm → stow")
@@ -678,12 +750,31 @@ class ScriptedFinalMission(Node):
                 self.car.stop()
                 self._phase_goto(1)
         elif self._phase == 1:
+            if not self._phase_entered:
+                self._phase_entered = True
+                # Record the heading at turn start so the watchdog can tell a
+                # blocked car (never rotated) apart from a near-miss settle.
+                self._exit_turn_yaw0 = self.pose[2]
             if self._turn_to_yaw(wp["yaw"]):
                 self._phase_goto(2)
             elif elapsed > timeout:
-                self.get_logger().warn(
-                    f"[DOOR_EXIT_WAIT] turn watchdog ({elapsed:.1f}s) — settling here"
-                )
+                turned_deg = abs(math.degrees(
+                    _norm_ang(self.pose[2] - self._exit_turn_yaw0)))
+                if turned_deg < 2.0:
+                    # Commanded ROTATE for the whole window but the car never
+                    # moved — almost certainly jammed against a door that did
+                    # not open wide enough. Loud so it isn't read as a benign
+                    # tolerance miss (Rule 12: fail loud).
+                    self.get_logger().error(
+                        f"[DOOR_EXIT_WAIT] turn watchdog ({elapsed:.1f}s) — car did NOT "
+                        f"rotate ({turned_deg:.1f}° in window) → likely BLOCKED on the "
+                        f"door (not opened wide enough); settling with yaw error"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"[DOOR_EXIT_WAIT] turn watchdog ({elapsed:.1f}s) — rotated "
+                        f"{turned_deg:.1f}° but short of tolerance; settling here"
+                    )
                 self.car.stop()
                 self._phase_goto(2)
         elif self._phase == 2:
@@ -693,11 +784,38 @@ class ScriptedFinalMission(Node):
                 self.get_logger().info(f"[DOOR_EXIT_WAIT] held {wait_s}s — continuing")
                 self._goto(next_state)
 
+    def _state_back_up(self, distance_m, speed, next_state):
+        """Reverse straight back `distance_m` (pose-measured) before continuing.
+        Run after the door opens to clear the doorway so the ramp comes into
+        view for the observe/scan chain."""
+        if not self._require_pose():
+            return
+        px, py, _ = self.pose
+        if self._anchor is None:
+            self._anchor = (px, py)
+            self.get_logger().info(
+                f"[BACK_UP_AFTER_TASK3] backing up {distance_m:.1f}m before ramp search"
+            )
+        ax, ay = self._anchor
+        travelled = math.hypot(px - ax, py - ay)
+        if travelled >= distance_m:
+            self.car.stop()
+            self.get_logger().info(
+                f"[BACK_UP_AFTER_TASK3] backed up {travelled:.2f}m → {next_state.name}"
+            )
+            self._goto(next_state)
+            return
+        self.car.publish_velocities(-speed, -speed)
+        self.get_logger().info(
+            f"[BACK_UP_AFTER_TASK3] backed up {travelled:.2f}/{distance_m:.1f}m"
+        )
+
     # ------------------------------------------------------------------
     # Ramp — observe, scan, approach
     # ------------------------------------------------------------------
 
-    def _state_move_observe(self, wp, next_state):
+    def _state_move_observe(self, chain, next_state):
+        wp = chain[self._observe_idx]
         if not self._require_pose():
             return
         if self._phase == 0:
@@ -707,9 +825,10 @@ class ScriptedFinalMission(Node):
             if self._turn_to_yaw(wp["yaw"]):
                 self._goto(next_state)
 
-    def _state_ramp_scan(self, found_next, not_found_next):
+    def _state_ramp_scan(self, chain, move_state, found_next, exhausted_next):
         c = self.cfg["ramp"]
         self.car.stop()
+        idx = self._observe_idx
 
         # Count distinct seg inferences only — seg publishes ~1 Hz while this
         # loop ticks at 10 Hz, so re-reading the same sticky message must not
@@ -726,7 +845,8 @@ class ScriptedFinalMission(Node):
         elapsed = time.monotonic() - self._state_t0
 
         self.get_logger().info(
-            f"[{self._state.name}] hits={hits}/{c['found_required_frames']} "
+            f"[{self._state.name}] point {idx + 1}/{len(chain)}  "
+            f"hits={hits}/{c['found_required_frames']} "
             f"(seg msgs seen={len(self._ramp_window)})  area={self.yolo.ramp_area_ratio():.3f}  "
             f"elapsed={elapsed:.1f}/{c['scan_seconds']:.0f}s"
         )
@@ -737,13 +857,22 @@ class ScriptedFinalMission(Node):
             return
 
         if elapsed > c["scan_seconds"]:
-            if not_found_next is not None:
+            # Walk the rest of this side's observe chain before giving up on the side.
+            if idx + 1 < len(chain):
+                self._observe_idx = idx + 1
                 self.get_logger().warn(
-                    f"[{self._state.name}] ramp not seen from this side → {not_found_next.name}"
+                    f"[{self._state.name}] ramp not seen at point {idx + 1} "
+                    f"→ next observe point {idx + 2}/{len(chain)}"
                 )
-                self._goto(not_found_next)
+                self._goto(move_state)
+            elif exhausted_next is not None:
+                self._observe_idx = 0   # fresh chain for the next side
+                self.get_logger().warn(
+                    f"[{self._state.name}] ramp not seen from this side → {exhausted_next.name}"
+                )
+                self._goto(exhausted_next)
             else:
-                self._fail("ramp not found from either observation side")
+                self._fail("ramp not found from any observation point")
 
     def _state_ramp_approach(self, next_state):
         c = self.cfg["ramp"]
