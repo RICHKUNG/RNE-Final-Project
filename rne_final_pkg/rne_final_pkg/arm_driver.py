@@ -15,6 +15,10 @@ def _deg(*angles):
 
 RESET_POS  = _deg(90, 30, 160, 180, 10)
 
+# Stow: fold the claw out of the camera view — same pose get_bear_node uses.
+# 3 joints only (base 180°, shoulder 0°, elbow 90°); arm_writer leaves the rest.
+STOW_POS = [math.pi, 0.0, math.pi / 2]
+
 # Intermediate raise: arm pointing upward with gripper open.
 # Reached BEFORE extending toward the bear so the arm descends from above
 # rather than sweeping horizontally through the bear. TUNE if needed.
@@ -42,6 +46,15 @@ class ArmDriver:
     def reset(self):
         self._joint_pos = list(RESET_POS)
         self._publish()
+
+    def stow(self):
+        msg = JointTrajectoryPoint()
+        msg.positions = list(STOW_POS)
+        msg.velocities = [0.0] * len(STOW_POS)
+        self._pub.publish(msg)
+
+    def subscriber_count(self):
+        return self._pub.get_subscription_count()
 
     def open_gripper(self):
         self._joint_pos[-1] = GRIPPER_OPEN

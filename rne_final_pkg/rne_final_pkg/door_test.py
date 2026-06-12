@@ -4,7 +4,7 @@ Subclasses ScriptedFinalMission and reuses its helpers and state handlers;
 only the INIT requirements and the state flow differ:
 
     INIT (pose + /yolo/knob_info, /yolo/target_info fallback)
-      → TASK3_KNOB_SERVO → TASK3_DOOR_PRESS_COMMIT → DONE
+      → TASK3_KNOB_SERVO → TASK3_DOOR_PRESS_COMMIT → TASK3_DOOR_EXIT_WAIT → DONE
 
 No Nav2.  Params come from scripted_mission.yaml (knob_servo / door_press).
 
@@ -65,7 +65,9 @@ class DoorTest(ScriptedFinalMission):
                 missing.append(f"/yolo/knob_info (target_info fallback after {_KNOB_GRACE_S:.0f}s)")
 
         if not missing:
-            self.arm.reset()   # stow arm clear of the camera
+            # Arm stow is handled by the inherited startup stow timer
+            # (_stow_arm_once) — calling arm.reset() here would un-stow it
+            # (RESET_POS raises the arm into the camera view).
             x, y, yaw = self.pose
             src = "target_info fallback" if self._use_target_fallback else "knob_info"
             self.get_logger().info(
@@ -89,7 +91,9 @@ class DoorTest(ScriptedFinalMission):
         elif s == S.TASK3_KNOB_SERVO:
             self._state_knob_servo(S.TASK3_DOOR_PRESS_COMMIT)
         elif s == S.TASK3_DOOR_PRESS_COMMIT:
-            self._state_door_press(S.DONE)
+            self._state_door_press(S.TASK3_DOOR_EXIT_WAIT)
+        elif s == S.TASK3_DOOR_EXIT_WAIT:
+            self._state_door_exit_wait(S.DONE)
         elif s == S.DONE:
             self.car.stop()
             if not self._done_logged:

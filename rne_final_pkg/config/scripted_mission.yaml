@@ -7,6 +7,14 @@ init:
   wait_timeout_s: 15.0
   # Pose older than this (seconds) counts as lost → mission stops and complains.
   pose_stale_s: 2.0
+  # Hands-off start: if AMCL has no pose after initial_pose_wait_s, publish
+  # /initialpose with the values below (map frame), repeating until localized.
+  # Spawn assumed at map origin (build_map starts SLAM there); yaw matches
+  # route.start_heading_yaw. Verify against the stored map before a real run.
+  initial_pose_wait_s: 3.0
+  initial_pose_x: 0.0
+  initial_pose_y: 0.0
+  initial_pose_yaw: 0.0486   # rad
 
 route:
   # Route to the door (measured 2026-06-12, map frame):
@@ -15,18 +23,23 @@ route:
   start_heading_yaw: 0.0486   # rad — heading at spawn (reference for calibration)
 
   turn_point:          # measured: end of the first straight leg from spawn
-    x: 2.8378860404780157
+    x: 3.0378860404780157
     y: 0.025078211891774258
     yaw: 0.0486        # rad — heading on arrival; left-turn target = yaw + pi/2
     tolerance: 0.20
   door_lane_point:     # PROVISIONAL calibration value, not measured:
-    x: 2.8378860404780157   #   x = turn_point.x
+    x: 3.0378860404780157   #   x = turn_point.x
     y: 1.6131596549874418   #   y = door_front.y
     tolerance: 0.20         # replace with the measured second-turn pose when available
   door_front:          # measured: standing point facing the door knob
     x: 3.058493898788231
     y: 1.6131596549874418
     yaw: 0.0341        # rad — final heading facing the knob (right-turn target)
+    tolerance: 0.15
+  door_exit_point:     # measured 2026-06-12: hold point just past the opened door
+    x: 3.5640017942719395
+    y: 1.5840655836032285
+    yaw: 0.0326        # rad — from measured quaternion (z=0.016320, w=0.999867)
     tolerance: 0.15
   long_side_observe:   # TODO calibrate: long-side ramp observation pose
     x: 0.0
@@ -45,11 +58,12 @@ route:
 
 control:
   fast_speed: 500.0
-  medium_speed: 300.0      # used for route legs
-  slow_speed: 150.0        # used for visual servo / final approach
-  turn_speed: 250.0
-  turn_slowdown_deg: 20.0  # yaw error below this → rotate at slow_speed (anti-overshoot)
-  yaw_tolerance_deg: 5.0   # turn-in-place completion threshold
+  medium_speed: 450.0      # used for route legs
+  slow_speed: 200.0        # used for visual servo / final approach
+  turn_speed: 400.0
+  turn_slow_speed: 250.0   # near-target rotation; 150 stalls in-place turns in Unity, 250 works
+  turn_slowdown_deg: 20.0  # yaw error below this → rotate at turn_slow_speed (anti-overshoot)
+  yaw_tolerance_deg: 3.0   # turn-in-place completion threshold, in DEGREES (plain number — YAML can't eval math.radians())
   forward_angle_deg: 20.0  # heading error below this → drive forward, else rotate
   xy_tolerance: 0.20       # default arrival tolerance when a waypoint omits one
 
@@ -66,28 +80,39 @@ debug:
   start_state: ""
 
 knob_servo:
-  target_depth_m: 0.30
+  target_depth_m: 0.50
+  # Commit window is [target - tol, target]: farther → forward, closer than
+  # (target - tol) → back up. Press pose only works at the 0.30 m standoff.
+  depth_tolerance_m: 0.03
   center_threshold_px: 40.0
   max_seconds: 20.0          # total servo budget; exceeded → FAILED (fail loud)
   invalid_depth_fail_s: 2.0  # knob centered but depth invalid for this long → FAILED
 
 door_press:
-  forward_before_press_m: 0.08
+  # Hit pose is calibrated for a 0.30 m car-to-knob gap = knob_servo
+  # target_depth_m (0.50) minus forward_before_press_m (0.20).
+  # Change those two together or the swing misses the knob.
+  forward_before_press_m: 0.20
   forward_during_press_m: 0.12
   push_after_unlock_m: 0.35
   push_speed: 120.0
   retry_count: 1
-  # Joint order matches arm_driver: base, shoulder, elbow, wrist, gripper (deg).
-  # TODO TUNE: placeholder poses — calibrate against the Unity door knob height.
-  arm_raise_deg:  [90.0, 10.0, 150.0, 180.0, 40.0]   # raised, clear of camera path
-  arm_press_deg:  [90.0, 60.0, 120.0, 120.0, 40.0]   # pressing down on the knob
+  exit_wait_s: 1.0           # hold at route.door_exit_point after the door opens
+  # Calibrated 2026-06-12 from /robot_arm echo (3 joints; arm_writer leaves the
+  # rest, same as STOW_POS). Raw radians: raise [0.0, 2.4609142, 1.5707963],
+  # press [0.9948377, 2.4609142, 1.5707963] = exactly the degrees below.
+  arm_raise_deg:  [0.0, 141.0, 90.0]    # gripper at highest point, above the knob
+  arm_press_deg:  [57.0, 141.0, 90.0]   # hit pose — just touches the knob at 0.30 m
+  # TODO TUNE: low pose the press continues to AFTER the hit pose, driving the
+  # knob fully down. Placeholder — joint0 deepened past 57°, not yet calibrated.
+  arm_press_low_deg: [80.0, 141.0, 90.0]
   arm_settle_s: 1.2          # wait after each arm command
   phase_timeout_s: 6.0       # per-phase watchdog: pose-distance phases give up after this
 
 ramp:
   # Reference only — the model is loaded by yolo_example_pkg/object_detect.py from its
   # installed share dir (SEG_MODEL_FILENAME). Listed here so calibration notes stay together.
-  model_path: "/home/howard/richkung/RNE/ros2_yolo_integration/src/yolo_example_pkg/models/ramp_yolo11s.pt"
+  model_path: "/home/howard/richkung/RNE/ros2_yolo_integration/src/yolo_example_pkg/models/ramp_yolo11n.pt"
   found_area_threshold: 0.03
   # Units = distinct seg inferences (~1 Hz; seg runs every SEG_CHECK_INTERVAL
   # camera frames), NOT 10 Hz control ticks.
