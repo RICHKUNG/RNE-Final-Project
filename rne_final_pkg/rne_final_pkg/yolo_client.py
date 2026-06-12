@@ -1,3 +1,5 @@
+import time
+
 from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import Marker
 
@@ -8,6 +10,7 @@ class YoloClient:
         self._marker = None
         self._bridge_info = None
         self._bridge_seq = 0
+        self._bridge_mono = None
         self._bear_info = None
         self._knob_info = None
 
@@ -26,6 +29,7 @@ class YoloClient:
     def _bridge_cb(self, msg):
         self._bridge_info = list(msg.data)
         self._bridge_seq += 1
+        self._bridge_mono = time.monotonic()
 
     def _bear_cb(self, msg):
         self._bear_info = list(msg.data)
@@ -63,7 +67,9 @@ class YoloClient:
 
     # ── ramp accessors ────────────────────────────────────────────────
     # The seg model now detects the ramp face; data still arrives on the
-    # legacy /yolo/bridge_info topic.  New code should use these names.
+    # legacy /yolo/bridge_info topic.  New publishers send:
+    # [legacy_bottom_found, dx, bottom_area_ratio, full_area_ratio].
+    # New ramp code should use these names.
 
     def ramp_topic_alive(self):
         return self._bridge_info is not None
@@ -75,14 +81,26 @@ class YoloClient:
         not control ticks re-reading the same sticky value."""
         return self._bridge_seq
 
+    def ramp_age_s(self):
+        return time.monotonic() - self._bridge_mono if self._bridge_mono is not None else None
+
     def ramp_visible(self):
-        return self.bridge_visible()
+        return self.bridge_visible() or self.ramp_full_area_ratio() > 0.0
 
     def ramp_delta_x(self):
         return self.bridge_delta_x()
 
-    def ramp_area_ratio(self):
+    def ramp_bottom_area_ratio(self):
         return self.bridge_area_ratio()
+
+    def ramp_full_area_ratio(self):
+        return self._bridge_info[3] if self._bridge_info and len(self._bridge_info) >= 4 else 0.0
+
+    def ramp_area_ratio(self):
+        # New ramp publishers append full-frame mask area at index 3.  Keep old
+        # three-field messages usable by falling back to the legacy bottom-half
+        # area at index 2.
+        return max(self.ramp_bottom_area_ratio(), self.ramp_full_area_ratio())
 
     # ── bear_info accessors ───────────────────────────────────────────
     # /yolo/bear_info: [found, distance, delta_x, pixel_x, pixel_y]

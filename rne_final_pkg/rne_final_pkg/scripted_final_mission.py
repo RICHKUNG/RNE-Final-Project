@@ -133,6 +133,8 @@ class ScriptedFinalMission(Node):
 
         self._ramp_window = deque(maxlen=int(self.cfg["ramp"]["found_window_frames"]))
         self._ramp_last_seq = None   # last counted seg message (see yolo_client.ramp_seq)
+        self._ramp_last_counted = False
+        self._ramp_last_hit = False
         self._observe_idx = 0        # index into the current side's observe chain
                                      # (survives MOVE→SCAN→MOVE; reset only on side switch)
         self._bridge_horizontal = False  # set if the ramp is seen on the outbound
@@ -168,6 +170,7 @@ class ScriptedFinalMission(Node):
         path = os.path.join(share, "config", "scripted_mission.yaml")
         with open(path) as f:
             self.cfg = yaml.safe_load(f)
+        self.get_logger().info(f"[CONFIG] loaded {path}")
 
         # Resolve debug.start_state at startup so a typo fails immediately,
         # not minutes into a run.
@@ -262,6 +265,8 @@ class ScriptedFinalMission(Node):
         self._anchor = None
         self._ramp_window = deque(maxlen=int(self.cfg["ramp"]["found_window_frames"]))
         self._ramp_last_seq = None
+        self._ramp_last_counted = False
+        self._ramp_last_hit = False
         self._classify_samples = []
         self._knob_invalid_t0 = None
         self._servo_settle_t0 = None
@@ -559,13 +564,20 @@ class ScriptedFinalMission(Node):
         found_area_threshold, overridden looser for the far outbound pre-check."""
         c = self.cfg["ramp"]
         thr = area_threshold if area_threshold is not None else c["found_area_threshold"]
+        self._ramp_last_counted = False
+        self._ramp_last_hit = False
+
         seq = self.yolo.ramp_seq()
-        if self._ramp_last_seq is None:
-            self._ramp_last_seq = seq
-        elif seq != self._ramp_last_seq:
-            self._ramp_last_seq = seq
-            found = self.yolo.ramp_visible() and self.yolo.ramp_area_ratio() > thr
-            self._ramp_window.append(1 if found else 0)
+        if seq <= 0 or seq == self._ramp_last_seq:
+            return sum(self._ramp_window)
+
+        self._ramp_last_seq = seq
+        age = self.yolo.ramp_age_s()
+        fresh = age is not None and age <= c.get("info_stale_s", 1.5)
+        found = fresh and self.yolo.ramp_visible() and self.yolo.ramp_area_ratio() >= thr
+        self._ramp_window.append(1 if found else 0)
+        self._ramp_last_counted = True
+        self._ramp_last_hit = found
         return sum(self._ramp_window)
 
     def _state_route(self, wp, next_state, watch_ramp=False):
@@ -895,9 +907,23 @@ class ScriptedFinalMission(Node):
         if not self._require_pose():
             return
         if self._phase == 0:
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info(
+                    f"[{self._state.name}] observe point "
+                    f"{self._observe_idx + 1}/{len(chain)}: "
+                    f"x={wp['x']:.3f} y={wp['y']:.3f} yaw={math.degrees(wp['yaw']):.1f}°"
+                )
             if self._drive_to_point(wp):
                 self._phase_goto(1)
         elif self._phase == 1:
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info(
+                    f"[{self._state.name}] observe point "
+                    f"{self._observe_idx + 1}/{len(chain)}: turn to "
+                    f"{math.degrees(wp['yaw']):.1f}°"
+                )
             if self._turn_to_yaw(wp["yaw"]):
                 self._goto(next_state)
 
@@ -908,11 +934,21 @@ class ScriptedFinalMission(Node):
 
         hits = self._accumulate_ramp_hits()
         elapsed = time.monotonic() - self._state_t0
+        age = self.yolo.ramp_age_s()
+        age_text = "n/a" if age is None else f"{age:.1f}s"
+        sample_text = (
+            "new-hit" if self._ramp_last_counted and self._ramp_last_hit
+            else "new-miss" if self._ramp_last_counted
+            else "same-seq"
+        )
 
         self.get_logger().info(
             f"[{self._state.name}] point {idx + 1}/{len(chain)}  "
             f"hits={hits}/{c['found_required_frames']} "
-            f"(seg msgs seen={len(self._ramp_window)})  area={self.yolo.ramp_area_ratio():.3f}  "
+            f"(seg msgs seen={len(self._ramp_window)}, {sample_text})  "
+            f"seq={self.yolo.ramp_seq()} found={int(self.yolo.ramp_visible())} age={age_text}  "
+            f"area={self.yolo.ramp_area_ratio():.3f} "
+            f"(bottom={self.yolo.ramp_bottom_area_ratio():.3f}, full={self.yolo.ramp_full_area_ratio():.3f})  "
             f"elapsed={elapsed:.1f}/{c['scan_seconds']:.0f}s"
         )
 

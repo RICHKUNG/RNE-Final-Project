@@ -204,10 +204,16 @@ ramp:
   # Reference only — the model is loaded by yolo_example_pkg/object_detect.py from its
   # installed share dir (SEG_MODEL_FILENAME). Listed here so calibration notes stay together.
   model_path: "/home/howard/richkung/RNE/ros2_yolo_integration/src/yolo_example_pkg/models/ramp_yolo11n.pt"
-  found_area_threshold: 0.03
+  # Ramp scan uses the larger of:
+  #   - bottom-area ratio (legacy /yolo/bridge_info[2])
+  #   - full-frame mask ratio (/yolo/bridge_info[3])
+  # This catches short-side observations where Foxglove shows the ramp mask
+  # higher in the frame but the legacy bottom-half score is still near zero.
+  found_area_threshold: 0.01
+  info_stale_s: 1.5
   # Units = distinct seg inferences (~1 Hz; seg runs every SEG_CHECK_INTERVAL
   # camera frames), NOT 10 Hz control ticks.
-  found_required_frames: 3
+  found_required_frames: 2
   found_window_frames: 6
   # Outbound pre-check (SEGMENT_1, spawn→turn_point): the ramp is seen from far
   # away here so it fills much less of the frame than the close-range observe
@@ -215,7 +221,7 @@ ramp:
   # "bridge is horizontal" flag. Tune against the去程 log if it under/over-fires.
   outbound_area_threshold: 0.01
   outbound_required_frames: 2
-  scan_seconds: 10.0         # max time scanning per observation side
+  scan_seconds: 5.0         # max time scanning per observation side
   center_threshold_px: 50.0
   approach_speed: 120.0
   approach_done_area: 0.15   # ramp fills this much of bottom half → close enough, classify bears
