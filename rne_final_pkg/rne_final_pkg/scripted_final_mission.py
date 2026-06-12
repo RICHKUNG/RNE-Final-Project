@@ -655,15 +655,33 @@ class ScriptedFinalMission(Node):
 
     def _state_door_exit_wait(self, next_state):
         """Drive to the measured pose just past the opened door and hold for
-        door_press.exit_wait_s before continuing."""
+        door_press.exit_wait_s before continuing.
+
+        Fine positioning: tight tolerance at slow speed, with the door_press
+        phase watchdog so a hunt/stall settles in place instead of hanging."""
         wp = self.cfg["route"]["door_exit_point"]
         if self._phase in (0, 1) and not self._require_pose():
             return
+        timeout = self.cfg["door_press"]["phase_timeout_s"]
+        elapsed = time.monotonic() - self._phase_t0
+
         if self._phase == 0:
-            if self._drive_to_point(wp):
+            if self._drive_to_point(wp, speed=self.cfg["control"]["slow_speed"]):
+                self._phase_goto(1)
+            elif elapsed > timeout:
+                self.get_logger().warn(
+                    f"[DOOR_EXIT_WAIT] positioning watchdog ({elapsed:.1f}s) — settling here"
+                )
+                self.car.stop()
                 self._phase_goto(1)
         elif self._phase == 1:
             if self._turn_to_yaw(wp["yaw"]):
+                self._phase_goto(2)
+            elif elapsed > timeout:
+                self.get_logger().warn(
+                    f"[DOOR_EXIT_WAIT] turn watchdog ({elapsed:.1f}s) — settling here"
+                )
+                self.car.stop()
                 self._phase_goto(2)
         elif self._phase == 2:
             self.car.stop()

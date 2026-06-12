@@ -40,7 +40,8 @@ route:
     x: 3.5640017942719395
     y: 1.5840655836032285
     yaw: 0.0326        # rad — from measured quaternion (z=0.016320, w=0.999867)
-    tolerance: 0.15
+    tolerance: 0.05    # tight: the push ends near this point, so a loose
+                       # tolerance skips the positioning drive entirely
   long_side_observe:   # TODO calibrate: long-side ramp observation pose
     x: 0.0
     y: 0.0
@@ -96,7 +97,7 @@ door_press:
   forward_during_press_m: 0.12
   push_after_unlock_m: 0.35
   push_speed: 120.0
-  retry_count: 1
+  retry_count: 0             # extra unconditional re-presses; door opens first try
   exit_wait_s: 1.0           # hold at route.door_exit_point after the door opens
   # Calibrated 2026-06-12 from /robot_arm echo (3 joints; arm_writer leaves the
   # rest, same as STOW_POS). Raw radians: raise [0.0, 2.4609142, 1.5707963],
