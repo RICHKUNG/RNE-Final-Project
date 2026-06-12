@@ -56,11 +56,12 @@ class S(Enum):
     TASK3_ROUTE_SEGMENT_3 = auto()       # short straight to route.door_front
     TASK3_KNOB_SERVO = auto()
     TASK3_DOOR_PRESS_COMMIT = auto()
-    TASK3_DOOR_EXIT_WAIT = auto()        # hold just past the door for exit_wait_s
+    TASK3_TURN_FORWARD = auto()          # turn left back to yaw≈0 (face forward) after the push
     BACK_UP_AFTER_TASK3 = auto()         # reverse a fixed distance before ramp search
 
     MOVE_TO_RAMP_OBSERVE_LONG_SIDE = auto()
     RAMP_SCAN_LONG_SIDE = auto()
+    MOVE_TO_LONG_SHORT_CORNER = auto()   # perimeter corner: avoid diagonal over the bridge
     MOVE_TO_RAMP_OBSERVE_SHORT_SIDE = auto()
     RAMP_SCAN_SHORT_SIDE = auto()
     RAMP_APPROACH = auto()
@@ -282,9 +283,11 @@ class ScriptedFinalMission(Node):
         elif s == S.TASK3_KNOB_SERVO:
             self._state_knob_servo(S.TASK3_DOOR_PRESS_COMMIT)
         elif s == S.TASK3_DOOR_PRESS_COMMIT:
-            self._state_door_press(S.TASK3_DOOR_EXIT_WAIT)
-        elif s == S.TASK3_DOOR_EXIT_WAIT:
-            self._state_door_exit_wait(S.BACK_UP_AFTER_TASK3)
+            self._state_door_press(S.TASK3_TURN_FORWARD)
+        elif s == S.TASK3_TURN_FORWARD:
+            # The arc push leaves the car yawed off; rotate back to face forward
+            # (map +x, yaw=0) before reversing for the ramp search.
+            self._state_turn_to(0.0, S.BACK_UP_AFTER_TASK3)
         elif s == S.BACK_UP_AFTER_TASK3:
             self._state_back_up(
                 self.cfg["post_task3"]["backup_distance_m"],
@@ -297,7 +300,14 @@ class ScriptedFinalMission(Node):
             self._state_ramp_scan(self.cfg["route"]["long_side_observe"],
                                   move_state=S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE,
                                   found_next=S.RAMP_APPROACH,
-                                  exhausted_next=S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE)
+                                  exhausted_next=S.MOVE_TO_LONG_SHORT_CORNER)
+        elif s == S.MOVE_TO_LONG_SHORT_CORNER:
+            # Route around the outer perimeter instead of diagonally across the
+            # inner corner (which crosses the bridge). _state_route drives straight
+            # to the corner; the right-edge→bottom-edge legs fall out of the
+            # heading-then-forward control in _drive_to_point.
+            self._state_route(self.cfg["route"]["long_to_short_corner"],
+                              S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE)
         elif s == S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE:
             self._state_move_observe(self.cfg["route"]["short_side_observe"], S.RAMP_SCAN_SHORT_SIDE)
         elif s == S.RAMP_SCAN_SHORT_SIDE:
@@ -726,62 +736,6 @@ class ScriptedFinalMission(Node):
                     "[DOOR_PRESS] commit done "
                     "(TODO: no door-open verification possible — camera was blocked)"
                 )
-                self._goto(next_state)
-
-    def _state_door_exit_wait(self, next_state):
-        """Drive to the measured pose just past the opened door and hold for
-        door_press.exit_wait_s before continuing.
-
-        Fine positioning: tight tolerance at slow speed, with the door_press
-        phase watchdog so a hunt/stall settles in place instead of hanging."""
-        wp = self.cfg["route"]["door_exit_point"]
-        if self._phase in (0, 1) and not self._require_pose():
-            return
-        timeout = self.cfg["door_press"]["phase_timeout_s"]
-        elapsed = time.monotonic() - self._phase_t0
-
-        if self._phase == 0:
-            if self._drive_to_point(wp, speed=self.cfg["control"]["slow_speed"]):
-                self._phase_goto(1)
-            elif elapsed > timeout:
-                self.get_logger().warn(
-                    f"[DOOR_EXIT_WAIT] positioning watchdog ({elapsed:.1f}s) — settling here"
-                )
-                self.car.stop()
-                self._phase_goto(1)
-        elif self._phase == 1:
-            if not self._phase_entered:
-                self._phase_entered = True
-                # Record the heading at turn start so the watchdog can tell a
-                # blocked car (never rotated) apart from a near-miss settle.
-                self._exit_turn_yaw0 = self.pose[2]
-            if self._turn_to_yaw(wp["yaw"]):
-                self._phase_goto(2)
-            elif elapsed > timeout:
-                turned_deg = abs(math.degrees(
-                    _norm_ang(self.pose[2] - self._exit_turn_yaw0)))
-                if turned_deg < 2.0:
-                    # Commanded ROTATE for the whole window but the car never
-                    # moved — almost certainly jammed against a door that did
-                    # not open wide enough. Loud so it isn't read as a benign
-                    # tolerance miss (Rule 12: fail loud).
-                    self.get_logger().error(
-                        f"[DOOR_EXIT_WAIT] turn watchdog ({elapsed:.1f}s) — car did NOT "
-                        f"rotate ({turned_deg:.1f}° in window) → likely BLOCKED on the "
-                        f"door (not opened wide enough); settling with yaw error"
-                    )
-                else:
-                    self.get_logger().warn(
-                        f"[DOOR_EXIT_WAIT] turn watchdog ({elapsed:.1f}s) — rotated "
-                        f"{turned_deg:.1f}° but short of tolerance; settling here"
-                    )
-                self.car.stop()
-                self._phase_goto(2)
-        elif self._phase == 2:
-            self.car.stop()
-            wait_s = self.cfg["door_press"]["exit_wait_s"]
-            if time.monotonic() - self._phase_t0 > wait_s:
-                self.get_logger().info(f"[DOOR_EXIT_WAIT] held {wait_s}s — continuing")
                 self._goto(next_state)
 
     def _state_back_up(self, distance_m, speed, next_state):

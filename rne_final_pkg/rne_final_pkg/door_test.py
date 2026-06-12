@@ -4,7 +4,7 @@ Subclasses ScriptedFinalMission and reuses its helpers and state handlers;
 only the INIT requirements and the state flow differ:
 
     INIT (pose + /yolo/knob_info, /yolo/target_info fallback)
-      → TASK3_KNOB_SERVO → TASK3_DOOR_PRESS_COMMIT → TASK3_DOOR_EXIT_WAIT → DONE
+      → TASK3_KNOB_SERVO → TASK3_DOOR_PRESS_COMMIT → DONE
 
 No Nav2.  Params come from scripted_mission.yaml (knob_servo / door_press).
 
@@ -91,9 +91,7 @@ class DoorTest(ScriptedFinalMission):
         elif s == S.TASK3_KNOB_SERVO:
             self._state_knob_servo(S.TASK3_DOOR_PRESS_COMMIT)
         elif s == S.TASK3_DOOR_PRESS_COMMIT:
-            self._state_door_press(S.TASK3_DOOR_EXIT_WAIT)
-        elif s == S.TASK3_DOOR_EXIT_WAIT:
-            self._state_door_exit_wait(S.DONE)
+            self._state_door_press(S.DONE)
         elif s == S.DONE:
             self.car.stop()
             if not self._done_logged:

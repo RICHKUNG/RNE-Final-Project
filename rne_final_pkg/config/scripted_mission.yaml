@@ -73,6 +73,15 @@ route:
       y: -0.11186797965906972
       yaw: 1.713559      # yaw_deg 98.17
       tolerance: 0.25
+  long_to_short_corner:  # Perimeter corner between the long and short observe chains.
+    # Going straight from the long chain's last point to the short chain's first
+    # point cuts a diagonal across the inner corner — straight over the bridge.
+    # Instead route through this OUTER corner: drive down the right edge (x of the
+    # long side) to the bottom edge (y of the short side), then the short-side
+    # move turns to face +y. Two right-angle legs, no diagonal.
+    x: 3.0    # ≈ long_side right edge x (matches long_side_observe last point)
+    y: -0.046 # ≈ short_side bottom edge y (matches short_side_observe first point)
+    tolerance: 0.25
   origin:              # TODO calibrate: drop-off / return point
     x: 0.0
     y: 0.0
