@@ -1722,7 +1722,7 @@ class ScriptedFinalMission(Node):
         self._servo_sub_t0 = time.monotonic()
         self._servo_burst_s = dur
         self._servo_burst_cmd = cmd
-        if sub == "FORWARD":
+        if sub in ("FORWARD", "CRUISE"):
             self.car.publish_velocities(cmd, cmd)
         elif sub in ("TURN", "SEARCH"):
             self.car.publish_velocities(cmd, -cmd)
@@ -1787,6 +1787,35 @@ class ScriptedFinalMission(Node):
                     self.car.publish_velocities(self._servo_burst_cmd, -self._servo_burst_cmd)
                 return False
             self._servo_enter_burst("SETTLE", 0.0, 0.0)  # burst done → re-settle
+            return False
+
+        # --- CRUISE: continuous far approach. Unlike the blind bursts above, this
+        # re-reads the (lagged) bear every tick to decide WHEN to stop — not for
+        # tight alignment — so the car drives straight at a far bear with no stop-
+        # and-look gaps. Stops to re-settle once near (hand to the careful stepper),
+        # if the bear is lost, or if heading drifts past the wide cruise band. ---
+        if self._servo_sub == "CRUISE":
+            if not self._bear_visible(group) or self.yolo.bear_age_s() is None:
+                self.car.stop()
+                self._servo_enter_burst("SETTLE", 0.0, 0.0)
+                return False
+            dx = self._bear_delta_x(group)
+            d = self._bear_distance(group)
+            cruise_until = b.get("cruise_until_m", b["grab_distance_m"])
+            cruise_band = b.get("cruise_align_band_px", b["align_threshold_px"] * 3.0)
+            near_now = d is not None and math.isfinite(d) and 0.0 < d <= cruise_until
+            if near_now or abs(dx) > cruise_band:
+                if d is not None and math.isfinite(d) and d > 0.0:
+                    self._bear_last_settle_depth = d
+                d_text = f"{d:.2f}m" if (d is not None and math.isfinite(d)) else "n/a"
+                why = "near" if near_now else f"off-heading dx={dx:.0f}px"
+                self.get_logger().info(
+                    f"[{self._state.name}] cruise stop ({why}, d={d_text}) → settle"
+                )
+                self.car.stop()
+                self._servo_enter_burst("SETTLE", 0.0, 0.0)
+                return False
+            self.car.publish_velocities(self._servo_burst_cmd, self._servo_burst_cmd)
             return False
 
         # --- SETTLE: stop, wait for the image to catch up, then read & decide ---
@@ -1891,9 +1920,30 @@ class ScriptedFinalMission(Node):
                 b.get("grab_commit_forward_speed", slow),
             )
             cap = b.get("clear_blocking_forward_s", b.get("align_forward_min_s", 0.1))
+            # A blocking bear creeps into the depth cam's blind zone and vanishes
+            # ~1cm short of grab_target, so the at_depth snapshot above never
+            # fires. Cache the most recent near (aligned) view each settle so
+            # CLEAR can still grab it once it's lost — otherwise the approach
+            # never converges and CLEAR loops approach<->backup forever.
+            if d is not None and math.isfinite(d) and 0.0 < d <= b["grab_distance_m"]:
+                self._cache_bear_grab_snapshot(group, d, dx)
         else:
             near = (d is not None and 0 < d < b["grab_distance_m"]) or was_recently_near
             branch = "near" if near else "far"
+            # Far + aligned → drive CONTINUOUSLY at the bear instead of the pulsed
+            # stop-and-look creep. Precise alignment doesn't matter this far out, so
+            # the camera lag is harmless; CRUISE re-reads the (lagged) bear each
+            # tick only to know WHEN to hand back to the careful near stepper.
+            if not near and b.get("far_continuous", True):
+                speed = b.get(
+                    "cruise_forward_speed", b.get("climb_forward_speed", slow)
+                )
+                self.get_logger().info(
+                    f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m "
+                    f"(far) → CRUISE @{speed:.0f}"
+                )
+                self._servo_enter_burst("CRUISE", 0.0, speed)
+                return False
             # far creep doubles as the ramp climb; let it run faster than the global
             # slow_speed (gravity raises the effective stall floor on the incline)
             # without disturbing visual-servo / final-approach / probe speeds.
@@ -1919,6 +1969,23 @@ class ScriptedFinalMission(Node):
                 if sub_elapsed >= b.get("align_settle_s", 0.4):
                     if not self._bear_visible("blocking") or self.yolo.bear_age_s() is None:
                         self.car.stop()
+                        prev_d = self._bear_last_settle_depth
+                        near = (
+                            prev_d is not None and math.isfinite(prev_d)
+                            and 0.0 < prev_d <= b["grab_distance_m"]
+                        )
+                        snap = self._current_bear_grab_snapshot("blocking")
+                        if near and snap is not None:
+                            # Bear vanished at close range → it's right at the
+                            # gripper (inside the depth cam's blind zone), not
+                            # lost. Grab it with the cached close-range snapshot
+                            # instead of backing up, else CLEAR loops forever.
+                            self.get_logger().info(
+                                "[CLEAR_BEAR] blocking bear lost at close range "
+                                f"(last d={prev_d:.2f}m, snap={snap['source']}) → GRAB"
+                            )
+                            self._phase_goto(1)
+                            return
                         self._clear_lost_state = lost_state
                         self.get_logger().warn(
                             "[CLEAR_BEAR] blocking bear not visible after settle "

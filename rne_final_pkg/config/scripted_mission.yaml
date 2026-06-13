@@ -342,6 +342,23 @@ bear:
   # incline's raised stall floor; scoped here so visual servo / final approach / probe
   # keep using slow_speed. Drops back to grab_commit_forward_speed once near.
   climb_forward_speed: 450.0
+  # 2026-06-14 (Mr.Kung): far ramp-bear approach drives CONTINUOUSLY instead of the
+  # pulsed stop-and-look creep. While the bear is far, precise alignment doesn't
+  # matter, so the camera lag is harmless and the car can just open up and drive at
+  # it. CRUISE re-reads the (lagged) bear each tick only to know when to stop:
+  #   - cruise_forward_speed: continuous far speed. More aggressive than the pulsed
+  #     climb_forward_speed; raise for a faster run-up (Unity stall floor ~250).
+  #   - cruise_until_m: stop cruising and hand back to the careful near stop-and-look
+  #     stepper once the (lagged) depth reaches this. Keep == grab_distance_m so the
+  #     car never cruises into the close-range zone (overshoot from the ~0.3s lag is
+  #     bounded and still well above grab_target_distance_m).
+  #   - cruise_align_band_px: if heading drifts past this wide band, stop and re-settle
+  #     for a precise TURN (the tight align band is only enforced near the bear).
+  #   - far_continuous: false restores the old pulsed FORWARD-burst far creep.
+  far_continuous: true
+  cruise_forward_speed: 600.0
+  cruise_until_m: 0.55
+  cruise_align_band_px: 150.0
   # Blocking bears are under/near the bridge entrance, not on the ramp climb.
   # Use one-tick, low-speed nudges so losing bbox cannot launch the car onto the bridge.
   clear_blocking_forward_speed: 220.0
@@ -367,7 +384,7 @@ bear:
   safe_pre_arm_pose_deg: [0.0, 141.0, 90.0]
   # Auto grab wrist/second-axis offset applied inside pros_car's arm_controller_2D.
   # Positive tilts the claw more forward from the IK pose.
-  grab_wrist_forward_offset_deg: 25.0
+  grab_wrist_forward_offset_deg: 30.0
   # Close-range bbox/marker can disappear while the arm raises; hold the grab-pose
   # target snapshot briefly so CLEAR_BEAR does not oscillate forward/backward.
   grab_snapshot_max_age_s: 2.0
