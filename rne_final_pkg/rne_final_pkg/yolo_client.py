@@ -191,6 +191,8 @@ class YoloClient:
 
     # ── bear_info accessors ───────────────────────────────────────────
     # /yolo/bear_info: [found, distance, delta_x, pixel_x, pixel_y, on_ramp]
+    # Optional tail from newer YOLO node:
+    # [candidate_count, dist, dx, px, py, foot_y, conf, ...]
 
     def bear_topic_alive(self):
         return self._bear_info is not None
@@ -213,9 +215,43 @@ class YoloClient:
     def bear_pixel_y(self):
         return self._bear_info[4] if self._bear_info and len(self._bear_info) >= 5 else 0.0
 
+    def bear_pixel_x(self):
+        return self._bear_info[3] if self._bear_info and len(self._bear_info) >= 4 else 0.0
+
     def bear_on_ramp(self):
         """1.0 on ramp, 0.0 blocking, -1.0 unknown (no ramp mask / old detector)."""
         return self._bear_info[5] if self._bear_info and len(self._bear_info) >= 6 else -1.0
+
+    def bear_candidates(self):
+        if not self._bear_info or len(self._bear_info) < 17:
+            if not self.bear_visible():
+                return []
+            return [{
+                "distance": self.bear_distance(),
+                "delta_x": self.bear_delta_x(),
+                "pixel_x": self.bear_pixel_x(),
+                "pixel_y": self.bear_pixel_y(),
+                "foot_y": self.bear_pixel_y(),
+                "conf": 1.0,
+            }]
+
+        count = int(max(0, self._bear_info[16]))
+        out = []
+        base = 17
+        width = 6
+        for i in range(count):
+            off = base + i * width
+            if len(self._bear_info) < off + width:
+                break
+            out.append({
+                "distance": self._bear_info[off],
+                "delta_x": self._bear_info[off + 1],
+                "pixel_x": self._bear_info[off + 2],
+                "pixel_y": self._bear_info[off + 3],
+                "foot_y": self._bear_info[off + 4],
+                "conf": self._bear_info[off + 5],
+            })
+        return out
 
     # Per-group bears (publisher splits by bbox centre-y vs ramp centre-y).
     # data[6:11] = nearest blocking (under-bridge) bear: found, dist, delta_x, px, py
@@ -239,6 +275,10 @@ class YoloClient:
         g = self._group(6)
         return g[2] if g and g[0] == 1.0 else 0.0
 
+    def blocking_bear_pixel_x(self):
+        g = self._group(6)
+        return g[3] if g and g[0] == 1.0 else 0.0
+
     def blocking_bear_pixel_y(self):
         g = self._group(6)
         return g[4] if g and g[0] == 1.0 else 0.0
@@ -254,6 +294,10 @@ class YoloClient:
     def ramp_bear_delta_x(self):
         g = self._group(11)
         return g[2] if g and g[0] == 1.0 else 0.0
+
+    def ramp_bear_pixel_x(self):
+        g = self._group(11)
+        return g[3] if g and g[0] == 1.0 else 0.0
 
     def ramp_bear_pixel_y(self):
         g = self._group(11)

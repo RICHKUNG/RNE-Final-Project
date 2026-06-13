@@ -22,9 +22,13 @@ from enum import Enum, auto
 
 import rclpy
 import rclpy.time
+import rclpy.duration
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 import tf2_ros
-from geometry_msgs.msg import PoseWithCovarianceStamped
+import tf2_geometry_msgs  # noqa: F401  (registers PointStamped transform)
+from geometry_msgs.msg import PoseWithCovarianceStamped, PointStamped
+from sensor_msgs.msg import CameraInfo
 from ament_index_python.packages import get_package_share_directory
 import yaml
 
@@ -103,6 +107,23 @@ class ScriptedFinalMission(Node):
             PoseWithCovarianceStamped, "/amcl_pose", self._amcl_cb, 10
         )
 
+        # Depth-camera intrinsics — used to back-project bear candidates into the
+        # map frame so a grab retry can re-lock the SAME (ground) bear by world
+        # position instead of the new overall-nearest one. Publisher latches with
+        # TRANSIENT_LOCAL, so the QoS must match to receive it.
+        self._camera_info = None
+        camera_info_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            CameraInfo,
+            self.cfg["bear"].get("camera_info_topic", "/camera/depth/camera_info"),
+            self._camera_info_cb,
+            camera_info_qos,
+        )
+
         # /initialpose — hands-off start: repeat-publish the configured spawn
         # pose until AMCL localizes (same pattern as get_bear_node).
         self._initialpose_pub = self.create_publisher(
@@ -147,6 +168,9 @@ class ScriptedFinalMission(Node):
                                      # straight to the short-side observe chain.
                                      # Persists across _goto (not reset there).
         self._approach_done = False  # ramp approach reached approach_done_area at least once
+        self._ramp_aligned = False   # RAMP_ALIGN_BOTTOM cleared its launch gate at least once;
+                                     # gates triage classify (pre-align) vs grasp classify (post-align).
+                                     # Persists across _goto (not reset there).
         self._classify_entries = 0
         self._classify_samples = []
         self._grab_retries = 0
@@ -162,11 +186,14 @@ class ScriptedFinalMission(Node):
         self._servo_sub_t0 = time.monotonic()
         self._servo_burst_s = 0.0
         self._servo_burst_cmd = 0.0
+        self._bear_last_settle_depth = None
+        self._bear_depth_jump_rejected = False
         self._grasp_verify_depth0 = None
         self._grasp_verify_seq0 = None
         self._grasp_verify_samples = []
         self._grasp_verify_last_seq = None
         self._grasp_verify_probe_m = 0.0
+        self._grasp_verify_lock = None
         self._return_exit_mode = None
         self._press_attempts = 0
         self._knob_invalid_t0 = None
@@ -254,6 +281,9 @@ class ScriptedFinalMission(Node):
         self._amcl = (p.x, p.y, _yaw_from_quat(q))
         self._amcl_mono = time.monotonic()
 
+    def _camera_info_cb(self, msg):
+        self._camera_info = msg
+
     def _update_pose(self):
         try:
             tf = self.tf_buffer.lookup_transform("map", _BASE_FRAME, rclpy.time.Time())
@@ -301,10 +331,13 @@ class ScriptedFinalMission(Node):
         self._grasp_verify_samples = []
         self._grasp_verify_last_seq = None
         self._grasp_verify_probe_m = 0.0
+        self._grasp_verify_lock = None
         self._auto_grab_triggered = False
         self._auto_grab_t0 = None
         self._auto_grab_marker = None
         self._bear_commit_t0 = None
+        self._bear_last_settle_depth = None
+        self._bear_depth_jump_rejected = False
 
     def _phase_goto(self, phase: int):
         self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
@@ -316,6 +349,8 @@ class ScriptedFinalMission(Node):
         self._auto_grab_t0 = None
         self._auto_grab_marker = None
         self._bear_commit_t0 = None
+        self._bear_last_settle_depth = None
+        self._bear_depth_jump_rejected = False
 
     def _fail(self, reason: str):
         self._fail_reason = reason
@@ -377,7 +412,7 @@ class ScriptedFinalMission(Node):
         elif s == S.RAMP_SCAN_LONG_SIDE:
             self._state_ramp_scan(self.cfg["route"]["long_side_observe"],
                                   move_state=S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE,
-                                  found_next=S.RAMP_ALIGN_BOTTOM,
+                                  found_next=S.RAMP_BEAR_CLASSIFY,
                                   exhausted_next=S.MOVE_TO_LONG_SHORT_CORNER)
         elif s == S.MOVE_TO_LONG_SHORT_CORNER:
             # Route around the outer perimeter instead of diagonally across the
@@ -391,7 +426,7 @@ class ScriptedFinalMission(Node):
         elif s == S.RAMP_SCAN_SHORT_SIDE:
             self._state_ramp_scan(self.cfg["route"]["short_side_observe"],
                                   move_state=S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE,
-                                  found_next=S.RAMP_ALIGN_BOTTOM,
+                                  found_next=S.RAMP_BEAR_CLASSIFY,
                                   exhausted_next=None)
         elif s == S.RAMP_ALIGN_BOTTOM:
             self._state_ramp_align_bottom(S.RAMP_APPROACH)
@@ -400,7 +435,11 @@ class ScriptedFinalMission(Node):
         elif s == S.RAMP_BEAR_CLASSIFY:
             self._state_bear_classify()
         elif s == S.CLEAR_BLOCKING_BEAR:
-            self._state_clear_blocking_bear(S.RAMP_APPROACH)
+            # After clearing a blocking bear the car has moved/pushed, so the old
+            # ramp-bottom alignment is stale: re-align to the ramp bottom edge
+            # before re-approaching and re-classifying (RAMP_ALIGN_BOTTOM ->
+            # RAMP_APPROACH -> RAMP_BEAR_CLASSIFY).
+            self._state_clear_blocking_bear(S.RAMP_ALIGN_BOTTOM)
         elif s == S.GRASP_RAMP_BEAR:
             self._state_grasp_ramp_bear(S.RETURN_ORIGIN)
         elif s == S.RETURN_ORIGIN:
@@ -1205,6 +1244,7 @@ class ScriptedFinalMission(Node):
             f"shape={shape_conf:.2f} skew={skew:.3f} → {next_state.name}"
         )
         self.car.stop()
+        self._ramp_aligned = True
         self._goto(next_state)
 
     def _state_ramp_approach(self, next_state):
@@ -1248,10 +1288,12 @@ class ScriptedFinalMission(Node):
         dx = self.yolo.align_center_dx() if self._ramp_align_fresh(c) else self.yolo.ramp_delta_x()
 
         if area >= c["approach_done_area"]:
-            self.get_logger().info(f"[RAMP_APPROACH] area={area:.3f} ≥ {c['approach_done_area']} → classify")
+            self.get_logger().info(
+                f"[RAMP_APPROACH] area={area:.3f} ≥ {c['approach_done_area']} → {next_state.name}"
+            )
             self.car.stop()
             self._approach_done = True
-            self._goto(S.RAMP_BEAR_CLASSIFY)
+            self._goto(next_state)
             return
 
         if abs(dx) > c["center_threshold_px"]:
@@ -1273,7 +1315,7 @@ class ScriptedFinalMission(Node):
     # Bear classification / handling
     # ------------------------------------------------------------------
 
-    def _state_bear_classify(self):
+    def _state_bear_classify(self, grasp_state=S.GRASP_RAMP_BEAR):
         b = self.cfg["bear"]
         self.car.stop()
 
@@ -1297,7 +1339,14 @@ class ScriptedFinalMission(Node):
             return
 
         if not self._classify_samples:
-            if self._approach_done:
+            if not self._ramp_aligned:
+                # Triage classify (before any align): no bear in the way → proceed
+                # to the normal ramp align/approach.
+                self.get_logger().info(
+                    "[CLASSIFY] triage: no bear samples → RAMP_ALIGN_BOTTOM"
+                )
+                self._goto(S.RAMP_ALIGN_BOTTOM)
+            elif self._approach_done:
                 self._fail(
                     "ramp reached but no bear visible — "
                     "TODO: extend search pattern around the ramp"
@@ -1335,11 +1384,21 @@ class ScriptedFinalMission(Node):
                 and avg_d < b["blocking_depth_threshold_m"]
             )
             basis = f"fallback depth={avg_d:.2f}m pixel_y={avg_py:.0f}"
+        if blocking:
+            decision = "BLOCKING_BEAR"
+            next_state = S.CLEAR_BLOCKING_BEAR
+        elif not self._ramp_aligned:
+            # Triage classify (before any align): nothing blocking the path →
+            # proceed to the normal ramp align/approach before grasping.
+            decision = "RAMP_BEAR (triage → align first)"
+            next_state = S.RAMP_ALIGN_BOTTOM
+        else:
+            decision = "RAMP_BEAR"
+            next_state = grasp_state
         self.get_logger().info(
-            f"[CLASSIFY] n={n}  {basis}  "
-            f"→ {'BLOCKING_BEAR' if blocking else 'RAMP_BEAR'}"
+            f"[CLASSIFY] n={n}  {basis}  → {decision}"
         )
-        self._goto(S.CLEAR_BLOCKING_BEAR if blocking else S.GRASP_RAMP_BEAR)
+        self._goto(next_state)
 
     def _bear_visible(self, group=None):
         if group == "blocking":
@@ -1362,6 +1421,94 @@ class ScriptedFinalMission(Node):
             return self.yolo.ramp_bear_delta_x()
         return self.yolo.bear_delta_x()
 
+    def _bear_pixel_x(self, group=None):
+        if group == "blocking":
+            return self.yolo.blocking_bear_pixel_x()
+        if group == "ramp":
+            return self.yolo.ramp_bear_pixel_x()
+        return self.yolo.bear_pixel_x()
+
+    def _bear_pixel_y(self, group=None):
+        if group == "blocking":
+            return self.yolo.blocking_bear_pixel_y()
+        if group == "ramp":
+            return self.yolo.ramp_bear_pixel_y()
+        return self.yolo.bear_pixel_y()
+
+    def _grasp_ramp_target_group_or_interrupt(self):
+        """Pick the current ramp-bear target group, or interrupt for a blocker."""
+        b = self.cfg["bear"]
+        age = self.yolo.bear_age_s()
+        if age is None or age > b.get("grab_info_stale_s", 0.7):
+            return None, False
+
+        if self.yolo.blocking_bear_visible():
+            self.car.stop()
+            self.get_logger().warn(
+                "[GRASP_RAMP_BEAR] blocking bear visible during ramp grab "
+                f"(d={self.yolo.blocking_bear_distance():.2f}m "
+                f"dx={self.yolo.blocking_bear_delta_x():.0f}px "
+                f"py={self.yolo.blocking_bear_pixel_y():.0f}) → CLEAR_BLOCKING_BEAR"
+            )
+            self._goto(S.CLEAR_BLOCKING_BEAR)
+            return None, True
+
+        if self.yolo.ramp_bear_visible():
+            return "ramp", False
+
+        # Backward-compatible fallback for older /yolo/bear_info without group fields.
+        if self.yolo.bear_visible() and self.yolo.bear_on_ramp() == 0.0:
+            self.car.stop()
+            self.get_logger().warn(
+                "[GRASP_RAMP_BEAR] legacy on_ramp=0 during ramp grab "
+                "→ CLEAR_BLOCKING_BEAR"
+            )
+            self._goto(S.CLEAR_BLOCKING_BEAR)
+            return None, True
+
+        return None, False
+
+    def _bear_grab_align_band_px(self, d):
+        """Depth-scaled grab band: physical lateral tolerance converted to pixels."""
+        b = self.cfg["bear"]
+        cap = float(b.get("grab_align_threshold_px", b["align_threshold_px"]))
+        info = self._camera_info
+        if info is None or d is None or not math.isfinite(d) or d <= 0.0:
+            return cap
+
+        fx = float(info.k[0]) if len(info.k) > 0 else 0.0
+        tol_m = float(b.get("grab_align_tol_m", 0.0))
+        if fx <= 0.0 or tol_m <= 0.0:
+            return cap
+
+        min_px = float(b.get("grab_align_min_px", 0.0))
+        return min(cap, max(min_px, tol_m * fx / d))
+
+    def _bear_forward_burst_duration(self, d, wheel_speed, cap_s):
+        """Bound a creep burst by the measured distance gap to grab_target."""
+        b = self.cfg["bear"]
+        min_s = float(b.get("align_forward_min_s", 0.1))
+        cap_s = float(cap_s)
+        if cap_s <= 0.0:
+            return 0.0, float("nan"), float("nan")
+        min_s = min(min_s, cap_s)
+
+        if d is None or not math.isfinite(d) or d <= 0.0:
+            return min_s, float("nan"), float("nan")
+
+        grab_target = b.get("grab_target_distance_m", b["grab_distance_m"])
+        gap = max(0.0, d - grab_target)
+        creep_mps = float(b.get("grab_creep_mps", 0.0))
+        commit_speed = abs(float(b.get("grab_commit_forward_speed", wheel_speed)))
+        if creep_mps <= 0.0 or commit_speed <= 0.0 or wheel_speed == 0.0:
+            return min_s, gap, float("nan")
+
+        scaled_mps = creep_mps * abs(float(wheel_speed)) / commit_speed
+        if scaled_mps <= 0.0:
+            return min_s, gap, float("nan")
+        dur = min(cap_s, max(min_s, gap / scaled_mps))
+        return dur, gap, scaled_mps
+
     def _bear_grab_ready(self, group=None):
         b = self.cfg["bear"]
         age = self.yolo.bear_age_s()
@@ -1369,12 +1516,16 @@ class ScriptedFinalMission(Node):
         d = self._bear_distance(group)
         dx = self._bear_delta_x(group)
         fresh = age is not None and age <= b.get("grab_info_stale_s", 0.7)
+        grab_target = b.get("grab_target_distance_m", b["grab_distance_m"])
+        at_depth = d is not None and 0.0 < d <= grab_target
+        band = self._bear_grab_align_band_px(d) if at_depth else b["align_threshold_px"]
         ready = (
             visible
             and fresh
+            and d is not None
             and math.isfinite(d)
-            and 0.0 < d < b["grab_distance_m"]
-            and abs(dx) <= b["align_threshold_px"]
+            and at_depth
+            and abs(dx) <= band
         )
         return ready, d, dx, age
 
@@ -1538,15 +1689,61 @@ class ScriptedFinalMission(Node):
             self._servo_enter_burst("SEARCH", b.get("align_search_burst_s", 0.3), turn)
             return False
 
-        dx = self._bear_delta_x(group)
-        d = self._bear_distance(group)
-        at_depth = 0 < d <= grab_target
-        # At grab depth, accept a generous alignment band — the arm's IK targets
-        # the bear's 3-D marker, which tolerates a small pixel offset, and the
-        # minimum executable turn (one ~0.1 s tick) can exceed a few-pixel error,
-        # so a tight band here just micro-turns forever. While still approaching,
-        # hold the tight band so the car doesn't drift off-centre.
-        band = b.get("grab_align_threshold_px", align_th) if at_depth else align_th
+        # On a grab retry the committed bear is locked to a world (map) spot.
+        # Track THAT bear, not the new overall-nearest, so the servo can't swing
+        # toward a different bear. Only constrains the overall stream; the blocking
+        # / ramp groups are already deterministic. If the locked bear can't be
+        # re-found this settle, re-search rather than chase the wrong one.
+        locked_view = self._locked_bear_view() if group is None else None
+        if (
+            group is None
+            and locked_view is None
+            and self._grasp_verify_lock
+            and self._grasp_verify_lock.get("map_pos") is not None
+        ):
+            self.get_logger().info(
+                f"[{self._state.name}] locked bear not at map spot after settle → search"
+            )
+            self._servo_enter_burst("SEARCH", b.get("align_search_burst_s", 0.3), turn)
+            return False
+
+        if locked_view is not None:
+            dx, d = locked_view
+        else:
+            dx = self._bear_delta_x(group)
+            d = self._bear_distance(group)
+
+        prev_d = self._bear_last_settle_depth
+        prev_valid = prev_d is not None and math.isfinite(prev_d) and prev_d > 0.0
+        was_recently_near = prev_valid and prev_d < b["grab_distance_m"]
+        jumped_from_near = False
+        d_for_step = d
+        if d is not None and math.isfinite(d) and d > 0.0:
+            jump_reject_m = float(b.get("depth_jump_reject_m", 0.0))
+            jumped_from_near = (
+                was_recently_near
+                and jump_reject_m > 0.0
+                and (d - prev_d) > jump_reject_m
+            )
+            if jumped_from_near:
+                d_for_step = prev_d
+                if not self._bear_depth_jump_rejected:
+                    self._bear_depth_jump_rejected = True
+                    self.get_logger().warn(
+                        f"[{self._state.name}] depth jump {prev_d:.2f}→{d:.2f}m "
+                        "near bear; reject frame and re-settle"
+                    )
+                    self._servo_enter_burst("SETTLE", 0.0, 0.0)
+                    return False
+                self.get_logger().warn(
+                    f"[{self._state.name}] repeated depth jump {prev_d:.2f}→{d:.2f}m; "
+                    f"using previous near depth {prev_d:.2f}m for creep sizing"
+                )
+            else:
+                self._bear_depth_jump_rejected = False
+                self._bear_last_settle_depth = d
+        at_depth = d is not None and 0 < d <= grab_target
+        band = self._bear_grab_align_band_px(d) if at_depth else align_th
 
         # 1) Outside the band → one rotate burst toward the bear, sized by |dx|.
         if abs(dx) > band:
@@ -1555,7 +1752,8 @@ class ScriptedFinalMission(Node):
                           abs(dx) * b.get("align_turn_s_per_px", 0.0015)))
             cmd = math.copysign(b.get("align_turn_speed", 260.0), dx)
             self.get_logger().info(
-                f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m → TURN {dur:.2f}s @{cmd:+.0f}"
+                f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m "
+                f"band={band:.0f}px → TURN {dur:.2f}s @{cmd:+.0f}"
             )
             self._servo_enter_burst("TURN", dur, cmd)
             return False
@@ -1563,23 +1761,32 @@ class ScriptedFinalMission(Node):
         # 2) Within band + at grab depth → done.
         if at_depth:
             self.get_logger().info(
-                f"[{self._state.name}] settled aligned dx={dx:.0f}px d={d:.2f}m → stop & grab"
+                f"[{self._state.name}] settled aligned dx={dx:.0f}px d={d:.2f}m "
+                f"band={band:.0f}px → stop & grab"
             )
             self._bear_commit_t0 = None
             self.car.stop()
             return True
 
         # 3) Aligned but not close (or depth invalid) → one short forward creep.
-        near = 0 < d < b["grab_distance_m"]
-        base = b.get("grab_commit_forward_speed", slow) if near else slow
-        dur = b.get("align_forward_near_s", 0.15) if near else b.get("align_forward_far_s", 0.3)
+        near = (d is not None and 0 < d < b["grab_distance_m"]) or was_recently_near
+        # far creep doubles as the ramp climb; let it run faster than the global
+        # slow_speed (gravity raises the effective stall floor on the incline)
+        # without disturbing visual-servo / final-approach / probe speeds.
+        base = b.get("grab_commit_forward_speed", slow) if near else b.get("climb_forward_speed", slow)
+        cap = b.get("align_forward_near_s", 0.15) if near else b.get("align_forward_far_s", 0.3)
+        dur, gap, mps = self._bear_forward_burst_duration(d_for_step, base, cap)
+        gap_text = "n/a" if not math.isfinite(gap) else f"{gap:.2f}m"
+        rate_text = "n/a" if not math.isfinite(mps) else f"{mps:.2f}m/s"
+        branch = "near" if near else "far"
         self.get_logger().info(
-            f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m → FWD {dur:.2f}s @{base:.0f}"
+            f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m "
+            f"({branch}, gap={gap_text}, rate={rate_text}) → FWD {dur:.2f}s @{base:.0f}"
         )
         self._servo_enter_burst("FORWARD", dur, base)
         return False
 
-    def _state_clear_blocking_bear(self, next_state):
+    def _state_clear_blocking_bear(self, next_state, lost_state=S.RAMP_BEAR_CLASSIFY):
         b = self.cfg["bear"]
         elapsed = time.monotonic() - self._phase_t0
 
@@ -1591,9 +1798,9 @@ class ScriptedFinalMission(Node):
                         self.car.stop()
                         self.get_logger().info(
                             "[CLEAR_BEAR] blocking bear not visible after settle "
-                            f"→ skip to {next_state.name}"
+                            f"→ re-classify ({lost_state.name})"
                         )
-                        self._goto(next_state)
+                        self._goto(lost_state)
                         return
             if self._bear_servo_step("blocking"):
                 self._phase_goto(1)
@@ -1651,6 +1858,136 @@ class ScriptedFinalMission(Node):
         valid = visible and fresh and math.isfinite(d) and d > 0.0
         return valid, seq, d, py, age
 
+    def _bear_candidate_map_pos(self, cand):
+        """Back-project a bear candidate (pixel + depth) into the map frame.
+
+        Returns (x, y) in map, or None when intrinsics / TF / depth are missing.
+        Pose-invariant: a stationary (ground) bear maps to the same world point
+        no matter where the car is, which is what lets a retry re-lock the same
+        bear instead of the new overall-nearest one."""
+        info = self._camera_info
+        if info is None:
+            return None
+        depth = cand.get("distance")
+        if depth is None or not math.isfinite(depth) or depth <= 0.0:
+            return None
+        K = info.k
+        fx, fy, cx, cy = K[0], K[4], K[2], K[5]
+        if fx == 0.0 or fy == 0.0:
+            return None
+        px = cand.get("pixel_x", 0.0)
+        py = cand.get("pixel_y", 0.0)
+        pt = PointStamped()
+        pt.header.frame_id = self.cfg["bear"].get("camera_frame", "camera_optical_frame")
+        pt.header.stamp = self.get_clock().now().to_msg()
+        pt.point.x = (px - cx) * depth / fx
+        pt.point.y = (py - cy) * depth / fy
+        pt.point.z = float(depth)
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "map", pt.header.frame_id, rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.2),
+            )
+            mp = tf2_geometry_msgs.do_transform_point(pt, tf)
+            return (mp.point.x, mp.point.y)
+        except Exception:
+            return None
+
+    def _locked_bear_view(self):
+        """On a grab retry, return the live candidate nearest the locked map spot
+        as (delta_x, distance), else None.
+
+        Lets the servo re-acquire the SAME ground bear it committed to, instead of
+        swinging to whatever is now overall-nearest (the wrong-way-turn bug)."""
+        lock = self._grasp_verify_lock
+        if not lock or lock.get("map_pos") is None:
+            return None
+        lx, ly = lock["map_pos"]
+        best = None
+        best_d = self.cfg["bear"].get("verify_lock_map_radius_m", 0.30)
+        for c in self.yolo.bear_candidates():
+            mp = self._bear_candidate_map_pos(c)
+            if mp is None:
+                continue
+            dist = math.hypot(mp[0] - lx, mp[1] - ly)
+            if dist <= best_d:
+                best_d = dist
+                best = c
+        if best is None:
+            return None
+        return best["delta_x"], best["distance"]
+
+    def _set_grasp_verify_lock_from_current_bear(self, group=None):
+        d = self._bear_distance(group)
+        dx = self._bear_delta_x(group)
+        py = self._bear_pixel_y(group)
+        if math.isfinite(d) and d > 0.0:
+            map_pos = self._bear_candidate_map_pos({
+                "distance": d,
+                "pixel_x": self._bear_pixel_x(group),
+                "pixel_y": py,
+            })
+            self._grasp_verify_lock = {
+                "distance": d, "delta_x": dx, "pixel_y": py, "map_pos": map_pos,
+            }
+            mp_text = "n/a" if map_pos is None else f"({map_pos[0]:.2f},{map_pos[1]:.2f})"
+            self.get_logger().info(
+                f"[GRASP_RAMP_BEAR] verify lock group={group or 'overall'} "
+                f"d={d:.2f}m dx={dx:.0f}px py={py:.0f} map={mp_text}"
+            )
+
+    def _candidate_matches_verify_lock(self, cand, lock):
+        b = self.cfg["bear"]
+        dx_tol = b.get("verify_lock_dx_tolerance_px", 120.0)
+        py_tol = b.get("verify_lock_py_tolerance_px", 180.0)
+        d_tol = b.get("verify_lock_depth_tolerance_m", 0.35)
+        return (
+            abs(cand["delta_x"] - lock["delta_x"]) <= dx_tol
+            and abs(cand["pixel_y"] - lock["pixel_y"]) <= py_tol
+            and abs(cand["distance"] - lock["distance"]) <= d_tol
+        )
+
+    def _fresh_locked_bear_depth(self):
+        b = self.cfg["bear"]
+        age = self.yolo.bear_age_s()
+        seq = self.yolo.bear_seq()
+        fresh = age is not None and age <= b.get("verify_info_stale_s", 0.7)
+        if not fresh:
+            return False, seq, float("inf"), 0.0, 0.0, age, "stale"
+
+        candidates = [
+            c for c in self.yolo.bear_candidates()
+            if math.isfinite(c["distance"]) and c["distance"] > 0.0
+        ]
+        if not candidates:
+            return False, seq, float("inf"), 0.0, 0.0, age, "no candidates"
+
+        lock = self._grasp_verify_lock
+        if lock is None:
+            chosen = min(candidates, key=lambda c: (c["distance"], abs(c["delta_x"])))
+        else:
+            matching = [c for c in candidates if self._candidate_matches_verify_lock(c, lock)]
+            if not matching:
+                return False, seq, float("inf"), 0.0, 0.0, age, "no locked candidate"
+            chosen = min(
+                matching,
+                key=lambda c: (
+                    abs(c["delta_x"] - lock["delta_x"]),
+                    abs(c["pixel_y"] - lock["pixel_y"]),
+                    abs(c["distance"] - lock["distance"]),
+                ),
+            )
+
+        return (
+            True,
+            seq,
+            chosen["distance"],
+            chosen["pixel_y"],
+            chosen["delta_x"],
+            age,
+            "locked",
+        )
+
     def _retry_grasp_or_fail(self, reason: str, restore_probe: bool):
         b = self.cfg["bear"]
         if not b.get("verify_retry_on_ground", True):
@@ -1676,20 +2013,34 @@ class ScriptedFinalMission(Node):
         elapsed = time.monotonic() - self._phase_t0
 
         if self._phase == 0:       # servo to the ramp bear
-            # After the car climbs onto the ramp, the ramp mask often leaves the
-            # camera view. The ramp-specific bear group then disappears even
-            # though the bear itself is still visible, so keep tracking the
-            # committed bear target through the overall target stream.
-            if self._bear_servo_step():
+            group, interrupted = self._grasp_ramp_target_group_or_interrupt()
+            if interrupted:
+                return
+            if self._bear_servo_step(group):
+                self._set_grasp_verify_lock_from_current_bear(group)
                 self._phase_goto(1)
 
         elif self._phase == 1:     # pre-arm, target_point, auto-arm grab (async)
-            if self._auto_grab_precondition_step("GRASP_RAMP_BEAR"):
+            group, interrupted = self._grasp_ramp_target_group_or_interrupt()
+            if interrupted:
+                return
+            if self._auto_grab_precondition_step("GRASP_RAMP_BEAR", group):
                 elapsed_after_trigger = time.monotonic() - self._auto_grab_t0
             else:
                 return
 
             if elapsed_after_trigger > b["grab_wait_seconds"]:
+                # Temporary: skip the probe/depth verify and return straight home
+                # once the grab wait completes. Toggle bear.skip_grasp_verify=false
+                # to restore the full verify chain (phases 2-4).
+                if b.get("skip_grasp_verify", False):
+                    self.car.stop()
+                    self.get_logger().info(
+                        "[GRASP_RAMP_BEAR] skip_grasp_verify=true → return without verify"
+                    )
+                    self._grab_retries = 0
+                    self._goto(next_state)
+                    return
                 self._phase_goto(2)
 
         elif self._phase == 2:     # verify: capture depth before a small probe move
@@ -1706,40 +2057,21 @@ class ScriptedFinalMission(Node):
             if elapsed < b.get("verify_baseline_observe_seconds", 0.3):
                 return
 
-            valid, seq, d, py, age = self._fresh_bear_depth()
+            valid, seq, d, py, dx, age, reason = self._fresh_locked_bear_depth()
             if not valid:
                 age_text = "none" if age is None else f"{age:.2f}s"
-                if b.get("verify_accept_missing_close_bear", True):
-                    self.get_logger().info(
-                        "[GRASP_RAMP_BEAR] grasp OK — no close bear visible after grab "
-                        f"(visible={self.yolo.bear_visible()} d={d:.2f}m age={age_text}) "
-                        f"→ {next_state.name}"
-                    )
-                    self._grab_retries = 0
-                    self._goto(next_state)
-                else:
-                    self._retry_grasp_or_fail(
-                        f"no valid bear depth before probe "
-                        f"(visible={self.yolo.bear_visible()} d={d:.2f}m age={age_text})",
-                        restore_probe=False,
-                    )
-                return
-
-            clear_depth = b.get("verify_clear_depth_m", 0.70)
-            if d >= clear_depth:
-                self.get_logger().info(
-                    f"[GRASP_RAMP_BEAR] grasp OK — close target no longer on ramp "
-                    f"(nearest bear d={d:.2f}m >= {clear_depth:.2f}m py={py:.0f}) "
-                    f"→ {next_state.name}"
+                self._retry_grasp_or_fail(
+                    f"no locked bear depth before probe "
+                    f"({reason}, age={age_text})",
+                    restore_probe=False,
                 )
-                self._grab_retries = 0
-                self._goto(next_state)
                 return
 
             self._grasp_verify_depth0 = d
             self._grasp_verify_seq0 = seq
             self.get_logger().info(
-                f"[GRASP_RAMP_BEAR] baseline d={d:.2f}m py={py:.0f} seq={seq} "
+                f"[GRASP_RAMP_BEAR] baseline locked d={d:.2f}m dx={dx:.0f}px "
+                f"py={py:.0f} seq={seq} "
                 "→ small BACKWARD probe"
             )
             self._phase_goto(3)
@@ -1771,14 +2103,14 @@ class ScriptedFinalMission(Node):
                 self._grasp_verify_samples = []
                 self._grasp_verify_last_seq = None
 
-            valid, seq, d, py, _age = self._fresh_bear_depth()
+            valid, seq, d, py, dx, _age, _reason = self._fresh_locked_bear_depth()
             if (
                 valid
                 and self._grasp_verify_seq0 is not None
                 and seq > self._grasp_verify_seq0
                 and seq != self._grasp_verify_last_seq
             ):
-                self._grasp_verify_samples.append((d, py, seq))
+                self._grasp_verify_samples.append((d, py, dx, seq))
                 self._grasp_verify_last_seq = seq
 
             if elapsed < b["verify_observe_seconds"]:
@@ -1809,38 +2141,32 @@ class ScriptedFinalMission(Node):
             avg_py = sum(sample[1] for sample in self._grasp_verify_samples) / len(
                 self._grasp_verify_samples
             )
+            avg_dx = sum(sample[2] for sample in self._grasp_verify_samples) / len(
+                self._grasp_verify_samples
+            )
             delta = abs(avg_d - depth0)
             tolerance = b.get("verify_depth_stable_tolerance_m", 0.05)
             arm_depth_th = b.get("verify_arm_depth_threshold", 0.35)
-            clear_depth = b.get("verify_clear_depth_m", 0.70)
 
-            if avg_d >= clear_depth:
+            if delta <= tolerance and avg_d < arm_depth_th:
                 self.get_logger().info(
-                    f"[GRASP_RAMP_BEAR] grasp OK — probe sees only far/other bear "
-                    f"(d0={depth0:.2f}m d1={avg_d:.2f}m py={avg_py:.0f}) "
-                    f"→ {next_state.name}"
-                )
-                self._grab_retries = 0
-                self._goto(next_state)
-            elif delta <= tolerance and avg_d < arm_depth_th:
-                self.get_logger().info(
-                    f"[GRASP_RAMP_BEAR] grasp OK — depth stable after probe "
+                    f"[GRASP_RAMP_BEAR] grasp OK — locked bear stable after probe "
                     f"(d0={depth0:.2f}m d1={avg_d:.2f}m Δ={delta:.2f}m "
-                    f"py={avg_py:.0f}) → return"
+                    f"dx={avg_dx:.0f}px py={avg_py:.0f}) → return"
                 )
                 self._grab_retries = 0
                 self._goto(next_state)
             elif delta <= tolerance:
                 self._retry_grasp_or_fail(
-                    f"depth stable but not in arm range "
-                    f"(d1={avg_d:.2f}m >= {arm_depth_th:.2f}m)",
+                    f"locked bear depth stable but not in arm range "
+                    f"(d1={avg_d:.2f}m >= {arm_depth_th:.2f}m, dx={avg_dx:.0f}px, py={avg_py:.0f})",
                     restore_probe=True,
                 )
             else:
                 self._retry_grasp_or_fail(
-                    f"depth changed after probe "
+                    f"locked bear depth changed after probe "
                     f"(d0={depth0:.2f}m d1={avg_d:.2f}m Δ={delta:.2f}m "
-                    f"> {tolerance:.2f}m)",
+                    f"> {tolerance:.2f}m, dx={avg_dx:.0f}px, py={avg_py:.0f})",
                     restore_probe=True,
                 )
 
@@ -1890,50 +2216,26 @@ class ScriptedFinalMission(Node):
             return "vertical"
         return "horizontal" if self._bridge_horizontal else "vertical"
 
-    def _return_bridge_region(self):
-        """Return the matched bridge coordinate region, or None if off-bridge."""
-        if self.pose is None:
-            return None
-
-        regions = self.cfg["return"].get("bridge_regions")
-        if not regions:
-            return {"name": "unconfigured"}
-
-        px, py, _ = self.pose
-        for region in regions:
-            x_min = float(region.get("x_min", -math.inf))
-            x_max = float(region.get("x_max", math.inf))
-            y_min = float(region.get("y_min", -math.inf))
-            y_max = float(region.get("y_max", math.inf))
-            if x_min <= px <= x_max and y_min <= py <= y_max:
-                return region
-        return None
-
     def _state_return_origin(self, next_state):
         r = self.cfg["return"]
         elapsed = time.monotonic() - self._phase_t0
 
-        if self._phase == 0:       # first leave the bridge, then route home
+        if self._phase == 0:       # leave the bridge by yaw, then route home
             if not self._require_pose():
                 return
             if self._anchor is None:
-                region = self._return_bridge_region()
-                if region is None:
-                    x, y, yaw = self.pose
-                    self.car.stop()
-                    self.get_logger().info(
-                        f"[RETURN] pose=({x:.2f},{y:.2f},{math.degrees(yaw):.0f}°) "
-                        "is outside bridge coordinate regions → origin route"
-                    )
-                    self._phase_goto(1)
-                    return
-
+                # Exit direction comes PURELY from yaw — never from XY map coords.
+                # Absolute XY drifts / gets mis-calibrated and wrongly reads
+                # "off-bridge", which sent the car into an in-place rotate on the
+                # ramp. RETURN always follows a ramp grab, so always back off the
+                # structure first. _anchor below is only a relative odometry start
+                # point for the reverse distance, not an absolute on-bridge test.
                 self._anchor = self.pose[:2]
                 self._return_exit_mode = self._select_return_exit_mode()
-                region_name = region.get("name", "unnamed")
+                x, y, yaw = self.pose
                 self.get_logger().info(
                     f"[RETURN] bridge exit mode={self._return_exit_mode} "
-                    f"region={region_name} yaw={math.degrees(self.pose[2]):.0f}°"
+                    f"yaw={math.degrees(yaw):.0f}° (yaw-based; XY ignored)"
                 )
 
             if self._return_exit_mode == "horizontal":

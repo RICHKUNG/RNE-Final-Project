@@ -69,7 +69,7 @@ route:
       y: 0
       yaw: 1.57     # yaw_deg 96.66
       tolerance: 0.25
-    - x: 0.9
+    - x: 0.85
       y: 0
       yaw: 1.57      # yaw_deg 98.17
       tolerance: 0.25
@@ -161,7 +161,7 @@ door_press:
   # 2026-06-13 field tune: 0.76 m / 3.0 s and 0.90 m / 4.0 s were both too short,
   # so raise the sanity distance to 1.12 m total and let the timed arc run longer.
   # forward_during_press_m (0.12) + push_after_unlock_m (1.00) = 1.12 m total.
-  push_after_unlock_m: 1.00
+  push_after_unlock_m: 0.9
   push_speed: 120.0          # straight segments: pre-press forward, retry backup
   # Arc push toward front-right while the claw holds the knob down. Hinge is
   # on the RIGHT (facing the door), handle on the LEFT, so the handle sweeps
@@ -179,9 +179,9 @@ door_press:
   # push_seconds. TUNE: too far past 90° → lower push_seconds (or push_speed_*);
   # not open enough → raise it. push_after_unlock_m below is now just a sanity
   # early-out, not the primary terminator.
-  push_seconds: 6.0
+  push_seconds: 3.0
   retry_count: 0             # extra unconditional re-presses; door opens first try
-  exit_wait_s: 1.0           # hold at route.door_exit_point after the door opens
+  exit_wait_s: 0.0           # hold at route.door_exit_point after the door opens
   # Calibrated 2026-06-12 from /robot_arm echo (3 joints; arm_writer leaves the
   # rest, same as STOW_POS). Raw radians: raise [0.0, 2.4609142, 1.5707963],
   # press [0.9948377, 2.4609142, 1.5707963] = exactly the degrees below.
@@ -272,11 +272,14 @@ bear:
   blocking_area_threshold: 0.05
   classify_observe_seconds: 1.5
   align_threshold_px: 50.0
-  # Generous alignment band applied ONLY at grab depth: the arm IK targets the
-  # bear's 3-D marker (tolerant of a small pixel offset) and the minimum one-tick
-  # turn can exceed a few-pixel error, so demanding the tight align_threshold_px
-  # at the very end just micro-turns forever. Must be ≥ align_threshold_px.
-  grab_align_threshold_px: 75.0
+  # Maximum/cap alignment band applied ONLY at grab depth. The runtime gate uses
+  # grab_align_tol_m + camera fx to convert a physical lateral tolerance to pixels,
+  # then floors/caps it with grab_align_min_px/grab_align_threshold_px.
+  # 2026-06-13: tightened 75->50 — 75px let the grab fire too far off-centre;
+  # require the bear within 50px of frame centre before grabbing.
+  grab_align_threshold_px: 50.0
+  grab_align_tol_m: 0.015
+  grab_align_min_px: 15.0
   # STOP-AND-LOOK bear servo (deadtime-immune). The camera→YOLO chain lags ~0.3 s,
   # so any move-while-watching loop (bang-bang or PD) commands against a stale dx
   # and limit-cycles — untunable, the deadtime is too large. Instead the car only
@@ -295,15 +298,19 @@ bear:
   # band in one step → an extra back-and-forth settle). Tune so a centred-ish dx
   # lands inside align_threshold_px in 1-2 bursts.
   align_turn_s_per_px: 0.0015
-  # MUST exceed the 10 Hz control-loop period (0.1 s): a burst shorter than one
-  # tick was being skipped before it ever published a wheel command (the car
-  # never turned, dx stuck). 0.15 = ~1.5 ticks, the floor for a turn that runs.
-  align_turn_min_s: 0.15
+  # Slightly above the 10 Hz control-loop period (0.1 s): _servo_enter_burst
+  # publishes immediately, and this keeps the minimum turn small enough for the
+  # tighter depth-scaled grab band to be reachable.
+  align_turn_min_s: 0.12
   align_turn_max_s: 0.5
-  # FORWARD creep burst durations: shorter when inside grab_distance_m so one step
-  # can't cross the grab_target→collision margin (~0.04 m); longer when still far.
+  # FORWARD creep burst durations are caps. Runtime also limits each burst by
+  # remaining depth gap (d - grab_target_distance_m), using grab_creep_mps below.
+  align_forward_min_s: 0.10
   align_forward_near_s: 0.15
   align_forward_far_s: 0.3
+  # Reject one sudden "farther" depth read after we were already near; repeated
+  # jumps are allowed to proceed only with near-branch creep sizing.
+  depth_jump_reject_m: 0.15
   # Re-acquire rotate burst when the bear isn't visible after a settle.
   align_search_burst_s: 0.3
   # YOLO bear markers arrive in camera_optical_frame, where z is forward depth,
@@ -311,21 +318,29 @@ bear:
   # stays in front of the camera; arm_controller_2D applies a small post-transform
   # lowering in arm_ik_base for camera-frame targets.
   grab_z_offset_m: 0.0
-  # Auto-grab starts only when the bear is freshly visible, centered within
-  # align_threshold_px, and strictly closer than this depth.
-  grab_distance_m: 0.4
-  # Closed-loop final approach: once inside grab_distance_m the car creeps
-  # forward at grab_commit_forward_speed, watching YOLO depth, and STOPS the
-  # instant depth reaches grab_target_distance_m. It never blind-pushes past it.
+  # Switch to careful near-branch creep once the bear is within this depth.
+  # Keep this comfortably above grab_target_distance_m so noisy close-range
+  # depth cannot leave the car in the large far/climb step.
+  grab_distance_m: 0.55
+  # Stop-and-look final approach: every settled frame sizes the next timed creep
+  # from the remaining YOLO depth gap, then stops and re-measures. The car still
+  # does not read vision while moving, but no single burst should be a 6 cm lunge
+  # near the bear.
   # FIELD FINDING (2026-06-13): the body collides with the bear at ~0.33 m YOLO
-  # depth (after which the bear is shoved out of frame). The arm grabs reliably
-  # at ~0.34 m. So the stop target sits just above the collision point. At 10 Hz
-  # one tick at 220 ≈ 0.011 m, so worst-case overshoot from a 0.351 reading
-  # lands ~0.339 m — still above the 0.33 m collision point.
-  grab_target_distance_m: 0.37
-  # grab_commit_forward_seconds: DEPRECATED — superseded by the depth-closed-loop
-  # creep above (the old timed open-loop push drove the body through the bear).
+  # depth (after which the bear is shoved out of frame). 2026-06-14 tune: 0.37
+  # stopped too far for the claw, so commit closer while staying above collision.
+  grab_target_distance_m: 0.35
+  # grab_commit_forward_seconds: DEPRECATED — superseded by the gap-bounded
+  # stop-and-look creep above (the old timed open-loop push drove the body through the bear).
   grab_commit_forward_speed: 220.0
+  # Measured forward rate at grab_commit_forward_speed; runtime scales linearly
+  # for climb_forward_speed when it must use the far branch.
+  grab_creep_mps: 0.11
+  # 2026-06-13: forward creep speed for the FAR bear-servo branch (d > grab_distance_m),
+  # which doubles as the ramp climb. Higher than control.slow_speed (350) to beat the
+  # incline's raised stall floor; scoped here so visual servo / final approach / probe
+  # keep using slow_speed. Drops back to grab_commit_forward_speed once near.
+  climb_forward_speed: 450.0
   # 0 = stop fully before/while the arm grabs. Was 120 (a forward creep to fight
   # gravity pulling the chassis back on the ramp), but the IK target is sampled
   # ONCE at trigger from the YOLO marker, then the car kept creeping for the full
@@ -350,47 +365,65 @@ bear:
   # the gripper closes. Matches get_bear_node's grab_wait_seconds. TUNE to the rig.
   grab_wait_seconds: 12.0
   servo_timeout_s: 600.0      # bear lost during servo for this long → FAILED
-  # Auto-retry only while a close bear is still visible after the grab. If the
-  # close target disappears, or YOLO only sees a far/other bear, accept the grab:
-  # the held bear can leave the detector's normal ground-depth geometry.
+  # Auto-retry uses a locked candidate from /yolo/bear_info's multi-bear tail:
+  # the bear closest to the pre-grab dx/py/depth is tracked through the probe so
+  # other bears in the frame cannot hijack verification.
+  # 2026-06-13 (Mr.Kung): temporarily skip the probe/depth verify after grabbing
+  # the ramp bear — once the grab wait completes, return straight to origin.
+  # Set false to restore the full verify chain (probe + depth-stability check).
+  skip_grasp_verify: false
   verify_retry_on_ground: true
   grab_retry_max: 2          # used only when verify_retry_on_ground=true
-  verify_accept_missing_close_bear: true
-  verify_clear_depth_m: 0.70 # if nearest bear is this far after grab, target is considered cleared
-  # Grasp verification fallback: only when a close bear remains visible, record
-  # depth, back up a little, then retry if the close bear behaves like it stayed
-  # on the ramp instead of being removed by the claw.
+  # 2026-06-13: widened lock tolerances. A grabbed bear is held ~0.3 m on the
+  # claw and is LIFTED, so its pixel_y jumps well above the pre-grab lock; the
+  # old 180 px gate dropped the locked candidate ("no locked candidate") and
+  # spuriously failed verify. dx also drifts as the held bear swings.
+  verify_lock_dx_tolerance_px: 160.0
+  verify_lock_py_tolerance_px: 280.0
+  verify_lock_depth_tolerance_m: 0.35
+  # 2026-06-13 (Mr.Kung): grab-RETRY target identity. The committed bear's GROUND
+  # position is locked in the map frame (back-projected from pixel+depth via
+  # camera_info + TF). On a retry the bear servo re-acquires the candidate within
+  # this radius of that world spot instead of the new overall-nearest bear, so it
+  # can't swing toward a different bear (the wrong-way-turn bug). If no candidate
+  # is within radius, the servo re-searches rather than chase the wrong one.
+  # Falls back to overall-nearest when camera_info/TF are unavailable (map_pos=None).
+  # Wide enough for localization noise, tight enough to exclude a neighbouring bear.
+  verify_lock_map_radius_m: 0.30
+  camera_frame: "camera_optical_frame"
+  camera_info_topic: "/camera/depth/camera_info"
+  # Grasp verification: record locked-bear depth, back up a little, then require
+  # the same locked bear to stay roughly stable. Tolerances are deliberately wider
+  # than raw depth noise because a held bear can swing in the claw.
   verify_baseline_observe_seconds: 0.3
   verify_probe_distance_m: 0.12
   verify_probe_min_distance_m: 0.06
   verify_probe_speed: 220.0
   verify_probe_timeout_s: 0.7
   verify_restore_timeout_s: 0.7
-  verify_observe_seconds: 0.8
+  # 2026-06-13: 0.8→1.2 so the wider min_frames window below has time to collect
+  # enough fresh samples without tripping "not enough fresh depth samples".
+  verify_observe_seconds: 1.2
   verify_info_stale_s: 0.7
-  verify_arm_depth_threshold: 0.35
-  verify_depth_min_frames: 1
-  verify_depth_stable_tolerance_m: 0.05
+  verify_arm_depth_threshold: 0.65
+  # 2026-06-13: 1→2. A held bear swings in the claw, so a single ~0.3 m depth
+  # frame can jitter past the stable tolerance and falsely report "depth
+  # changed". Averaging 2+ fresh frames smooths the swing.
+  verify_depth_min_frames: 2
+  # Keep at 0.10: the probe is 0.12 m, so a bear still on the ground shows
+  # delta ≈ 0.12 m. Raising this toward/over 0.12 would let a ground bear pass
+  # as a successful grasp. Fix swing-induced false fails via min_frames, not here.
+  verify_depth_stable_tolerance_m: 0.10
   clear_backward_seconds: 1.0
   clear_rotate_seconds: 1.2
 
 return:
-  # Before doing the bridge/ramp exit move, confirm the robot is still on the
-  # bridge by map coordinates. If the current pose is outside all regions below,
-  # RETURN skips the bridge exit and routes directly to origin.
-  # Tune these AABBs from /amcl_pose or TF logs after field calibration.
-  bridge_regions:
-    - name: long_side_bridge
-      x_min: 1.80
-      x_max: 3.20
-      y_min: 0.55
-      y_max: 1.20
-    - name: short_side_bridge
-      x_min: 1.45
-      x_max: 2.35
-      y_min: -0.15
-      y_max: 1.20
-  # Before driving home, leave the bridge/ramp in the safe direction:
+  # RETURN leaves the bridge/ramp BEFORE routing home, and picks the exit
+  # direction PURELY from yaw (_select_return_exit_mode) — never from XY map
+  # coords. 2026-06-13: the old XY AABB gate read pose (0.86,1.37) as
+  # "off-bridge" and sent the car into an in-place rotate on the ramp. z is no
+  # help either: map->base_footprint is ground-projected (z≈0 on a ramp per
+  # REP-120) and AMCL is 2D, so yaw is the only reliable on-bridge signal.
   #   horizontal / long-side bridge (yaw near ±180°) → drive forward 1.0 m
   #   vertical / short-side bridge (yaw near +90°)   → reverse 1.5 m
   bridge_yaw_select_threshold_deg: 55.0
