@@ -29,6 +29,7 @@ import tf2_ros
 import tf2_geometry_msgs  # noqa: F401  (registers PointStamped transform)
 from geometry_msgs.msg import PoseWithCovarianceStamped, PointStamped
 from sensor_msgs.msg import CameraInfo
+from visualization_msgs.msg import Marker
 from ament_index_python.packages import get_package_share_directory
 import yaml
 
@@ -177,6 +178,7 @@ class ScriptedFinalMission(Node):
         self._auto_grab_triggered = False
         self._auto_grab_t0 = None
         self._auto_grab_marker = None
+        self._bear_grab_snapshot = None
         self._bear_commit_t0 = None
         # Bear-servo stop-and-look sub-FSM (deadtime-immune alignment under the
         # ~0.3 s camera latency). SETTLE = stop & wait for the image to catch up
@@ -336,6 +338,7 @@ class ScriptedFinalMission(Node):
         self._auto_grab_triggered = False
         self._auto_grab_t0 = None
         self._auto_grab_marker = None
+        self._bear_grab_snapshot = None
         self._bear_commit_t0 = None
         self._bear_last_settle_depth = None
         self._bear_depth_jump_rejected = False
@@ -1544,6 +1547,76 @@ class ScriptedFinalMission(Node):
             return False, marker
         return True, marker
 
+    def _synth_bear_marker_from_current_view(self, group=None, d=None):
+        """Build a camera-frame marker from the current bear pixel/depth reading."""
+        info = self._camera_info
+        if info is None or len(info.k) < 6:
+            return None
+        if d is None or not math.isfinite(d) or d <= 0.0:
+            return None
+
+        fx = float(info.k[0])
+        fy = float(info.k[4])
+        cx = float(info.k[2])
+        cy = float(info.k[5])
+        if fx <= 0.0 or fy <= 0.0:
+            return None
+
+        px = float(self._bear_pixel_x(group))
+        py = float(self._bear_pixel_y(group))
+        if px <= 0.0:
+            px = cx + float(self._bear_delta_x(group))
+        if py <= 0.0:
+            py = cy
+
+        marker = Marker()
+        marker.header.frame_id = self.cfg["bear"].get("camera_frame", "camera_optical_frame")
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = f"{group or 'overall'}_bear_grab_snapshot"
+        marker.id = 0
+        marker.action = Marker.ADD
+        marker.type = Marker.SPHERE
+        marker.pose.position.x = (px - cx) * d / fx
+        marker.pose.position.y = (py - cy) * d / fy
+        marker.pose.position.z = d
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = marker.scale.y = marker.scale.z = 0.15
+        marker.color.r = 1.0
+        marker.color.g = 0.5
+        marker.color.b = 0.0
+        marker.color.a = 0.8
+        return marker
+
+    def _cache_bear_grab_snapshot(self, group, d, dx):
+        marker_ok, marker = self._target_marker_ready(group)
+        source = "live"
+        if not marker_ok:
+            marker = self._synth_bear_marker_from_current_view(group, d)
+            source = "synthetic" if marker is not None else "missing"
+        if marker is None:
+            self._bear_grab_snapshot = None
+            return None
+
+        snap = {
+            "group": group or "overall",
+            "marker": marker,
+            "source": source,
+            "d": d,
+            "dx": dx,
+            "t": time.monotonic(),
+        }
+        self._bear_grab_snapshot = snap
+        return snap
+
+    def _current_bear_grab_snapshot(self, group=None):
+        snap = self._bear_grab_snapshot
+        if not snap or snap.get("group") != (group or "overall"):
+            return None
+        max_age = float(self.cfg["bear"].get("grab_snapshot_max_age_s", 2.0))
+        if time.monotonic() - snap.get("t", 0.0) > max_age:
+            return None
+        return snap
+
     def _auto_grab_precondition_step(self, label: str, group=None):
         b = self.cfg["bear"]
         settle_s = b.get("pre_arm_settle_s", 0.5)
@@ -1552,6 +1625,13 @@ class ScriptedFinalMission(Node):
         if not self._phase_entered:
             ready, d, dx, age = self._bear_grab_ready(group)
             marker_ok, marker = self._target_marker_ready(group)
+            snap = self._current_bear_grab_snapshot(group)
+            if (not ready or not marker_ok) and snap is not None:
+                ready = True
+                marker_ok = True
+                marker = snap["marker"]
+                d = snap["d"]
+                dx = snap["dx"]
             if not ready or not marker_ok:
                 age_text = "none" if age is None else f"{age:.2f}s"
                 marker_state = "ok" if marker_ok else "missing/delete"
@@ -1566,7 +1646,7 @@ class ScriptedFinalMission(Node):
             self._phase_entered = True
             self._auto_grab_triggered = False
             self._auto_grab_t0 = None
-            self._auto_grab_marker = None
+            self._auto_grab_marker = marker
             if hold_speed > 0.0:
                 self.car.publish_velocities(hold_speed, hold_speed)
             else:
@@ -1591,11 +1671,25 @@ class ScriptedFinalMission(Node):
                 return False
             marker_ok, marker = self._target_marker_ready(group)
             if not marker_ok:
-                self.get_logger().warn(
-                    f"[{label}] {group or 'overall'} target marker missing at trigger → re-servo"
-                )
-                self._phase_goto(0)
-                return False
+                snap = self._current_bear_grab_snapshot(group)
+                if snap is not None:
+                    marker = snap["marker"]
+                    self.get_logger().warn(
+                        f"[{label}] {group or 'overall'} target marker missing at trigger "
+                        f"→ use {snap['source']} snapshot"
+                    )
+                elif self._auto_grab_marker is not None:
+                    marker = self._auto_grab_marker
+                    self.get_logger().warn(
+                        f"[{label}] {group or 'overall'} target marker missing at trigger "
+                        "→ use pre-arm marker"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"[{label}] {group or 'overall'} target marker missing at trigger → re-servo"
+                    )
+                    self._phase_goto(0)
+                    return False
             self._auto_grab_marker = marker
             self.arm.set_auto_grab_wrist_offset_deg(
                 b.get("grab_wrist_forward_offset_deg")
@@ -1772,9 +1866,11 @@ class ScriptedFinalMission(Node):
 
         # 2) Within band + at grab depth → done.
         if at_depth:
+            snap = self._cache_bear_grab_snapshot(group, d, dx)
+            snap_source = snap["source"] if snap is not None else "none"
             self.get_logger().info(
                 f"[{self._state.name}] settled aligned dx={dx:.0f}px d={d:.2f}m "
-                f"band={band:.0f}px → stop & grab"
+                f"band={band:.0f}px marker={snap_source} → stop & grab"
             )
             self._bear_commit_t0 = None
             self.car.stop()
