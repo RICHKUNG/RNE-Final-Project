@@ -1109,7 +1109,8 @@ class ScriptedFinalMission(Node):
         if self.yolo.bear_visible():
             self._classify_samples.append(
                 (self.yolo.bear_distance(), self.yolo.bear_pixel_y(),
-                 self.yolo.bear_on_ramp())
+                 self.yolo.bear_on_ramp(),
+                 self.yolo.blocking_bear_visible(), self.yolo.ramp_bear_visible())
             )
 
         elapsed = time.monotonic() - self._phase_t0
@@ -1131,12 +1132,21 @@ class ScriptedFinalMission(Node):
         avg_d = sum(s[0] for s in self._classify_samples) / n
         avg_py = sum(s[1] for s in self._classify_samples) / n
 
-        # Prefer the seg/det relation (bear bbox vs ramp mask) when the detector
-        # reports it: on_ramp==1 → ramp bear, ==0 → blocking. Fall back to the
-        # depth/pixel_y heuristic only when every sample is unknown (-1), e.g. no
-        # ramp mask in view or an old detector without the on_ramp field.
+        # Prefer the per-group bears (deterministic each frame, robust to two bears
+        # in view): if a blocking bear was seen in most samples, clear it first;
+        # else if an on-ramp bear was seen in most samples, grasp it. Fall back to
+        # the single on_ramp vote, then to the depth/pixel_y heuristic, when the
+        # ramp is out of view so the publisher can't classify either group.
+        blk_seen = sum(1 for s in self._classify_samples if len(s) > 3 and s[3])
+        rmp_seen = sum(1 for s in self._classify_samples if len(s) > 4 and s[4])
         ramp_votes = [s[2] for s in self._classify_samples if s[2] >= 0.0]
-        if ramp_votes:
+        if blk_seen > n / 2:
+            blocking = True
+            basis = f"blocking group {blk_seen}/{n} samples"
+        elif rmp_seen > n / 2:
+            blocking = False
+            basis = f"ramp group {rmp_seen}/{n} samples"
+        elif ramp_votes:
             on_ramp = sum(ramp_votes) / len(ramp_votes) >= 0.5
             blocking = not on_ramp
             basis = f"on_ramp_votes={len(ramp_votes)}/{n} mean={sum(ramp_votes)/len(ramp_votes):.2f}"
@@ -1270,34 +1280,43 @@ class ScriptedFinalMission(Node):
         dx = self.yolo.bear_delta_x()
         d = self.yolo.bear_distance()
 
-        if abs(dx) > b["align_threshold_px"]:
+        # Closed-loop final approach: STOP the instant depth reaches
+        # grab_target_distance_m (see note above — never blind-push through the
+        # bear at ~0.33 m).
+        grab_target = b.get("grab_target_distance_m", b["grab_distance_m"])
+        if 0 < d <= grab_target:
             self._bear_commit_t0 = None
-            self.get_logger().info(f"[{self._state.name}] dx={dx:.0f}px d={d:.2f}m → rotate")
-            self._rotate_dir(-dx, speed=turn)
-            return False
-        if 0 < d < b["grab_distance_m"]:
-            commit_s = b.get("grab_commit_forward_seconds", 0.0)
-            if commit_s > 0.0:
-                if self._bear_commit_t0 is None:
-                    self._bear_commit_t0 = time.monotonic()
-                    self.get_logger().info(
-                        f"[{self._state.name}] grab range d={d:.2f}m -> "
-                        f"commit forward {commit_s:.1f}s"
-                    )
-                commit_elapsed = time.monotonic() - self._bear_commit_t0
-                if commit_elapsed < commit_s:
-                    v = b.get("grab_commit_forward_speed", slow)
-                    self.car.publish_velocities(v, v)
-                    self.get_logger().info(
-                        f"[{self._state.name}] commit forward "
-                        f"{commit_elapsed:.1f}/{commit_s:.1f}s d={d:.2f}m"
-                    )
-                    return False
             self.car.stop()
+            self.get_logger().info(
+                f"[{self._state.name}] grab target reached d={d:.2f}m "
+                f"(<= {grab_target:.2f}m) → stop & grab"
+            )
             return True
+
+        # Forward base speed: creep inside grab_distance_m, slow otherwise.
+        if 0 < d < b["grab_distance_m"]:
+            base = b.get("grab_commit_forward_speed", slow)
+        else:
+            base = slow
+
+        # Proportional ARC steering instead of in-place pivots. The Unity car
+        # can't rotate in place below ~250 (stall floor), so a fixed pivot step
+        # overshoots the align band every tick and oscillates with large
+        # amplitude. Steering while creeping forward converges smoothly.
+        align_th = b["align_threshold_px"]
+        if abs(dx) <= align_th:
+            steer = 0.0
+        else:
+            gain = b.get("align_steer_gain", 1.0)
+            smax = b.get("align_steer_max", 200.0)
+            steer = max(-smax, min(smax, gain * (dx - math.copysign(align_th, dx))))
+        # dx>0 = bear right of center → turn right (left wheel faster).
         self._bear_commit_t0 = None
-        self.get_logger().info(f"[{self._state.name}] aligned d={d:.2f}m → forward slow")
-        self.car.publish_velocities(slow, slow)
+        self.car.publish_velocities(base + steer, base - steer)
+        self.get_logger().info(
+            f"[{self._state.name}] servo dx={dx:.0f}px d={d:.2f}m "
+            f"base={base:.0f} steer={steer:+.0f}"
+        )
         return False
 
     def _state_clear_blocking_bear(self, next_state):

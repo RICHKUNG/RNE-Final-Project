@@ -141,6 +141,48 @@ class YoloClient:
         """1.0 on ramp, 0.0 blocking, -1.0 unknown (no ramp mask / old detector)."""
         return self._bear_info[5] if self._bear_info and len(self._bear_info) >= 6 else -1.0
 
+    # Per-group bears (publisher splits by bbox centre-y vs ramp centre-y).
+    # data[6:11] = nearest blocking (under-bridge) bear: found, dist, delta_x, px, py
+    # data[11:16]= nearest on-ramp (on-bridge) bear:     found, dist, delta_x, px, py
+    # These are deterministic per frame, so a consumer can target one group
+    # without the overall-nearest target flipping between two visible bears.
+    def _group(self, base):
+        if self._bear_info and len(self._bear_info) >= base + 5:
+            return self._bear_info[base:base + 5]
+        return None
+
+    def blocking_bear_visible(self):
+        g = self._group(6)
+        return g is not None and g[0] == 1.0
+
+    def blocking_bear_distance(self):
+        g = self._group(6)
+        return g[1] if g and g[0] == 1.0 else float("inf")
+
+    def blocking_bear_delta_x(self):
+        g = self._group(6)
+        return g[2] if g and g[0] == 1.0 else 0.0
+
+    def blocking_bear_pixel_y(self):
+        g = self._group(6)
+        return g[4] if g and g[0] == 1.0 else 0.0
+
+    def ramp_bear_visible(self):
+        g = self._group(11)
+        return g is not None and g[0] == 1.0
+
+    def ramp_bear_distance(self):
+        g = self._group(11)
+        return g[1] if g and g[0] == 1.0 else float("inf")
+
+    def ramp_bear_delta_x(self):
+        g = self._group(11)
+        return g[2] if g and g[0] == 1.0 else 0.0
+
+    def ramp_bear_pixel_y(self):
+        g = self._group(11)
+        return g[4] if g and g[0] == 1.0 else 0.0
+
     # ── knob_info accessors ───────────────────────────────────────────
     # /yolo/knob_info: [found, distance, delta_x, pixel_x, pixel_y, area, conf]
     # distance = -1.0 when depth is invalid.

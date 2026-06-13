@@ -48,29 +48,29 @@ route:
   # to the short chain; exhausting both fails. yaw is radians (from the measured
   # quaternion; yaw_deg kept in the comment for reference).
   long_side_observe:   # car faces ≈ -x, scanning the ramp from the long side
-    - x: 3.1
+    - x: 3
       y: 2.3993529864074534
       yaw: -3.14    # yaw_deg -173.50
       tolerance: 0.25
-    - x: 3.1
+    - x: 3
       y: 1.5115117995190306
       yaw: -3.14     # yaw_deg -178.91
       tolerance: 0.25
-    - x: 3.1
+    - x: 3
       y: 0.9010239171932514
       yaw: -3.14     # yaw_deg -178.75
       tolerance: 0.25
   short_side_observe:  # car faces ≈ +y, scanning the ramp from the short side
     - x: 1.8089964857296893
-      y: -0.04615138122065065
+      y: 0
       yaw: 1.57      # yaw_deg 89.21
       tolerance: 0.25
     - x: 1.54922645232404
-      y: -0.17849396546502885
+      y: 0
       yaw: 1.57     # yaw_deg 96.66
       tolerance: 0.25
     - x: 0.89347816558855
-      y: -0.11186797965906972
+      y: 0
       yaw: 1.57      # yaw_deg 98.17
       tolerance: 0.25
   long_to_short_corner:  # Perimeter corner between the long and short observe chains.
@@ -91,8 +91,8 @@ control:
   fast_speed: 700.0
   medium_speed: 450.0      # used for route legs
   slow_speed: 400.0        # used for visual servo / final approach
-  turn_speed: 300.0
-  turn_slow_speed: 300.0   # near-target rotation; 150 stalls in-place turns in Unity, 250 works
+  turn_speed: 400.0
+  turn_slow_speed: 400.0   # near-target rotation; 150 stalls in-place turns in Unity, 250 works
   turn_slowdown_deg: 20.0  # yaw error below this → rotate at turn_slow_speed (anti-overshoot)
   yaw_tolerance_deg: 3.0   # turn-in-place completion threshold, in DEGREES (plain number — YAML can't eval math.radians())
   forward_angle_deg: 20.0  # heading error below this → drive forward, else rotate
@@ -241,6 +241,15 @@ bear:
   blocking_area_threshold: 0.05
   classify_observe_seconds: 1.5
   align_threshold_px: 50.0
+  # ARC steering for the final bear approach (replaces in-place pivots, which
+  # overshoot the align band and oscillate — the Unity car stalls rotating in
+  # place below ~250). Outside align_threshold_px, the car creeps forward while
+  # steering proportionally to the pixel offset beyond the band:
+  #   steer = clamp(align_steer_gain * (|dx| - align_threshold_px), align_steer_max)
+  # left/right = base ± steer. Bigger gain = sharper turn (risk: re-introduces
+  # oscillation); bigger max = harder max turn. Lower both if it still swings.
+  align_steer_gain: 1.0
+  align_steer_max: 200.0
   # Lowers the published /clicked_point target below the bear marker so the
   # gripper descends from above (top-down grab). Applied on this (mission) side;
   # arm_controller_2D's own offset is 0.0. Larger = gripper aims lower; 0.0 =
@@ -249,10 +258,17 @@ bear:
   # Auto-grab starts only when the bear is freshly visible, centered within
   # align_threshold_px, and strictly closer than this depth.
   grab_distance_m: 0.4
-  # Once inside grab_distance_m, keep pushing forward briefly instead of
-  # stopping on the ramp face. This prevents the car from holding a standoff,
-  # sliding backward, then re-servoing forever.
-  grab_commit_forward_seconds: 0.8
+  # Closed-loop final approach: once inside grab_distance_m the car creeps
+  # forward at grab_commit_forward_speed, watching YOLO depth, and STOPS the
+  # instant depth reaches grab_target_distance_m. It never blind-pushes past it.
+  # FIELD FINDING (2026-06-13): the body collides with the bear at ~0.33 m YOLO
+  # depth (after which the bear is shoved out of frame). The arm grabs reliably
+  # at ~0.34 m. So the stop target sits just above the collision point. At 10 Hz
+  # one tick at 220 ≈ 0.011 m, so worst-case overshoot from a 0.351 reading
+  # lands ~0.339 m — still above the 0.33 m collision point.
+  grab_target_distance_m: 0.37
+  # grab_commit_forward_seconds: DEPRECATED — superseded by the depth-closed-loop
+  # creep above (the old timed open-loop push drove the body through the bear).
   grab_commit_forward_speed: 220.0
   # 0 = stop fully before/while the arm grabs. Was 120 (a forward creep to fight
   # gravity pulling the chassis back on the ramp), but the IK target is sampled
