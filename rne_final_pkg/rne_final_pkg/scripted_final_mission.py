@@ -1571,11 +1571,14 @@ class ScriptedFinalMission(Node):
                 self.car.publish_velocities(hold_speed, hold_speed)
             else:
                 self.car.stop()
+            wrist_offset = b.get("grab_wrist_forward_offset_deg")
+            self.arm.set_auto_grab_wrist_offset_deg(wrist_offset)
             self.arm.safe_pre_arm_pose(b.get("safe_pre_arm_pose_deg"))
             self.get_logger().info(
                 f"[{label}] SAFE_PRE_ARM_POSE → wait {settle_s:.1f}s, "
                 f"then publish target_point and trigger auto_arm "
-                f"(d={d:.2f}m dx={dx:.0f}px frame={marker.header.frame_id})"
+                f"(d={d:.2f}m dx={dx:.0f}px frame={marker.header.frame_id} "
+                f"wrist_offset={wrist_offset})"
             )
             return False
 
@@ -1594,6 +1597,9 @@ class ScriptedFinalMission(Node):
                 self._phase_goto(0)
                 return False
             self._auto_grab_marker = marker
+            self.arm.set_auto_grab_wrist_offset_deg(
+                b.get("grab_wrist_forward_offset_deg")
+            )
             self.arm.auto_grab_marker(marker, b.get("grab_z_offset_m", 0.0))
             self._auto_grab_triggered = True
             self._auto_grab_t0 = time.monotonic()

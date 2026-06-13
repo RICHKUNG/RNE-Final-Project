@@ -2,7 +2,7 @@ import math
 import time
 from geometry_msgs.msg import PointStamped
 from trajectory_msgs.msg import JointTrajectoryPoint
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Float32
 
 # Joint index reference
 # 0: base rotation  0–180°
@@ -48,6 +48,9 @@ class ArmDriver:
         # /clicked_point sets a fresh target marker in RosCommunicator and
         # triggers the same auto_arm grab path through main2.on_clicked_point_grab.
         self._clicked_point_pub = node.create_publisher(PointStamped, "/clicked_point", 10)
+        self._wrist_offset_pub = node.create_publisher(
+            Float32, "/arm_grab_wrist_forward_offset_deg", 10
+        )
         self._joint_pos = list(RESET_POS)
 
     def _publish_positions(self, positions):
@@ -97,6 +100,13 @@ class ArmDriver:
 
     def subscriber_count(self):
         return self._pub.get_subscription_count()
+
+    def set_auto_grab_wrist_offset_deg(self, offset_deg):
+        if offset_deg is None:
+            return
+        msg = Float32()
+        msg.data = float(offset_deg)
+        self._wrist_offset_pub.publish(msg)
 
     def open_gripper(self):
         self._joint_pos = self._full_joint_pos()

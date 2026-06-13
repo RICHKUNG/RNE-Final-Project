@@ -365,6 +365,9 @@ bear:
   # Direct /robot_arm degrees, calibrated from /robot_arm echo:
   # [0.0, 141.0, 90.0] = raised claw pose that avoids sweeping through the bear.
   safe_pre_arm_pose_deg: [0.0, 141.0, 90.0]
+  # Auto grab wrist/second-axis offset applied inside pros_car's arm_controller_2D.
+  # Positive tilts the claw more forward from the IK pose.
+  grab_wrist_forward_offset_deg: 30.0
   pre_arm_settle_s: 0.5
   # Seconds to wait after triggering the auto_arm_human IK grab (/clicked_point)
   # before depth-probe verification. The grab runs in arm_controller_2D's background
