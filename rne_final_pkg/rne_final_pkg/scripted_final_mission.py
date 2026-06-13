@@ -2070,24 +2070,24 @@ class ScriptedFinalMission(Node):
             if elapsed_after_trigger > b["grab_wait_seconds"]:
                 self._phase_goto(3)   # no backup: deposit by turning 180° in place
 
-        elif self._phase == 2:     # back away from the ramp entrance
-            self.car.publish_velocities(
-                -self.cfg["control"]["slow_speed"], -self.cfg["control"]["slow_speed"]
-            )
-            if elapsed > b["clear_backward_seconds"]:
-                self._phase_goto(3)
-
-        elif self._phase == 3:     # turn aside (CW)
-            s = self.cfg["control"]["turn_speed"]
-            self.car.publish_velocities(s, -s)
-            if elapsed > b["clear_rotate_seconds"]:
-                self.car.stop()
-                self._phase_goto(4)
-
-        elif self._phase == 4:     # drop the bear beside the path
+        elif self._phase == 3:     # turn 180° in place to face away from the ramp
+            if not self._require_pose():
+                return
             if not self._phase_entered:
                 self._phase_entered = True
-                self.get_logger().info("[CLEAR_BEAR] dropping bear aside")
+                _, _, yaw = self.pose
+                self._clear_turn_target = _norm_ang(yaw + math.pi)
+                self.get_logger().info(
+                    "[CLEAR_BEAR] no backup — turning 180° in place → target "
+                    f"{math.degrees(self._clear_turn_target):.0f}°"
+                )
+            if self._turn_to_yaw(self._clear_turn_target):
+                self._phase_goto(4)
+
+        elif self._phase == 4:     # drop the bear behind, off the ramp path
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info("[CLEAR_BEAR] dropping bear behind")
                 self.arm.open_gripper()
             if elapsed > 1.0:
                 # Stow, not reset: the ramp re-approach after this needs the
@@ -2095,10 +2095,18 @@ class ScriptedFinalMission(Node):
                 self.arm.stow()
                 self._phase_goto(5)
 
-        elif self._phase == 5:     # turn back toward the ramp (CCW)
-            s = self.cfg["control"]["turn_speed"]
-            self.car.publish_velocities(-s, s)
-            if elapsed > b["clear_rotate_seconds"]:
+        elif self._phase == 5:     # turn 180° back to face the ramp again
+            if not self._require_pose():
+                return
+            if not self._phase_entered:
+                self._phase_entered = True
+                _, _, yaw = self.pose
+                self._clear_turn_target = _norm_ang(yaw + math.pi)
+                self.get_logger().info(
+                    "[CLEAR_BEAR] turning 180° back toward the ramp → target "
+                    f"{math.degrees(self._clear_turn_target):.0f}°"
+                )
+            if self._turn_to_yaw(self._clear_turn_target):
                 self.car.stop()
                 self.get_logger().info("[CLEAR_BEAR] cleared → back to ramp approach")
                 self._goto(next_state)
