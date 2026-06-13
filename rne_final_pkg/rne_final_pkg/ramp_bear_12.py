@@ -101,7 +101,8 @@ class RampBear12(ScriptedFinalMission):
             self._state_bear_classify(grasp_state=S.RAMP_ALIGN_BOTTOM)
         elif s == S.CLEAR_BLOCKING_BEAR:
             self._state_clear_blocking_bear(
-                S.RAMP_BEAR_CLASSIFY, lost_state=S.RAMP_ALIGN_BOTTOM
+                S.RAMP_BEAR_CLASSIFY,
+                lost_state=S.RAMP_BEAR_CLASSIFY,
             )
         elif s == S.RAMP_ALIGN_BOTTOM:
             self._state_ramp_align_bottom(S.RAMP_APPROACH)

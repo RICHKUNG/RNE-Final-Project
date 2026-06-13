@@ -188,6 +188,7 @@ class ScriptedFinalMission(Node):
         self._servo_burst_cmd = 0.0
         self._bear_last_settle_depth = None
         self._bear_depth_jump_rejected = False
+        self._clear_lost_state = None
         self._grasp_verify_depth0 = None
         self._grasp_verify_seq0 = None
         self._grasp_verify_samples = []
@@ -338,6 +339,7 @@ class ScriptedFinalMission(Node):
         self._bear_commit_t0 = None
         self._bear_last_settle_depth = None
         self._bear_depth_jump_rejected = False
+        self._clear_lost_state = None
 
     def _phase_goto(self, phase: int):
         self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
@@ -1184,7 +1186,11 @@ class ScriptedFinalMission(Node):
         skew = self.yolo.align_skew() if align_fresh else 0.0
         angle = self.yolo.align_angle_hint() if align_fresh else 0.0
 
-        if abs(dx) > c["center_threshold_px"]:
+        align_center_threshold = c.get(
+            "align_center_threshold_px",
+            c["center_threshold_px"],
+        )
+        if abs(dx) > align_center_threshold:
             self.get_logger().info(
                 f"[RAMP_ALIGN_BOTTOM] settled dx={dx:.0f}px edge={edge:.2f} "
                 f"shape={shape_conf:.2f} skew={skew:.3f} → center"
@@ -1769,16 +1775,25 @@ class ScriptedFinalMission(Node):
             return True
 
         # 3) Aligned but not close (or depth invalid) → one short forward creep.
-        near = (d is not None and 0 < d < b["grab_distance_m"]) or was_recently_near
-        # far creep doubles as the ramp climb; let it run faster than the global
-        # slow_speed (gravity raises the effective stall floor on the incline)
-        # without disturbing visual-servo / final-approach / probe speeds.
-        base = b.get("grab_commit_forward_speed", slow) if near else b.get("climb_forward_speed", slow)
-        cap = b.get("align_forward_near_s", 0.15) if near else b.get("align_forward_far_s", 0.3)
+        if group == "blocking":
+            near = False
+            branch = "blocking"
+            base = b.get(
+                "clear_blocking_forward_speed",
+                b.get("grab_commit_forward_speed", slow),
+            )
+            cap = b.get("clear_blocking_forward_s", b.get("align_forward_min_s", 0.1))
+        else:
+            near = (d is not None and 0 < d < b["grab_distance_m"]) or was_recently_near
+            branch = "near" if near else "far"
+            # far creep doubles as the ramp climb; let it run faster than the global
+            # slow_speed (gravity raises the effective stall floor on the incline)
+            # without disturbing visual-servo / final-approach / probe speeds.
+            base = b.get("grab_commit_forward_speed", slow) if near else b.get("climb_forward_speed", slow)
+            cap = b.get("align_forward_near_s", 0.15) if near else b.get("align_forward_far_s", 0.3)
         dur, gap, mps = self._bear_forward_burst_duration(d_for_step, base, cap)
         gap_text = "n/a" if not math.isfinite(gap) else f"{gap:.2f}m"
         rate_text = "n/a" if not math.isfinite(mps) else f"{mps:.2f}m/s"
-        branch = "near" if near else "far"
         self.get_logger().info(
             f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m "
             f"({branch}, gap={gap_text}, rate={rate_text}) → FWD {dur:.2f}s @{base:.0f}"
@@ -1796,11 +1811,12 @@ class ScriptedFinalMission(Node):
                 if sub_elapsed >= b.get("align_settle_s", 0.4):
                     if not self._bear_visible("blocking") or self.yolo.bear_age_s() is None:
                         self.car.stop()
-                        self.get_logger().info(
+                        self._clear_lost_state = lost_state
+                        self.get_logger().warn(
                             "[CLEAR_BEAR] blocking bear not visible after settle "
-                            f"→ re-classify ({lost_state.name})"
+                            f"→ BACKUP then {lost_state.name}"
                         )
-                        self._goto(lost_state)
+                        self._phase_goto(6)
                         return
             if self._bear_servo_step("blocking"):
                 self._phase_goto(1)
@@ -1846,6 +1862,18 @@ class ScriptedFinalMission(Node):
                 self.car.stop()
                 self.get_logger().info("[CLEAR_BEAR] cleared → back to ramp approach")
                 self._goto(next_state)
+
+        elif self._phase == 6:     # blocking bear lost during approach: undo forward drift
+            speed = b.get("clear_lost_backup_speed", self.cfg["control"]["slow_speed"])
+            self.car.publish_velocities(-speed, -speed)
+            if elapsed > b.get("clear_lost_backup_seconds", 0.8):
+                self.car.stop()
+                target = self._clear_lost_state or lost_state
+                self._clear_lost_state = None
+                self.get_logger().info(
+                    f"[CLEAR_BEAR] lost-target backup done → {target.name}"
+                )
+                self._goto(target)
 
     def _fresh_bear_depth(self):
         b = self.cfg["bear"]

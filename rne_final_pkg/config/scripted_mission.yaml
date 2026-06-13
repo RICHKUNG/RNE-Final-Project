@@ -242,25 +242,26 @@ ramp:
   # approach): visual-servo the ramp mask's near edge down to the frame bottom.
   # /yolo/bridge_info[4] reports that edge as y/(h-1): 0=top, 1=frame bottom.
   align_bottom_target_ratio: 0.95   # edge ≥ this counts as aligned to the bottom
-  align_speed: 120.0                 # forward creep speed while closing the gap
+  align_center_threshold_px: 70.0    # wider than approach: square-up yaw can shift dx
+  align_speed: 220.0                 # stronger short pulse; 120 can stall on ramp
   align_timeout_s: 15.0              # ramp not reacquired this long → go to approach anyway
   # STOP-AND-LOOK ramp alignment. Rotation stays above the Unity in-place stall
   # floor; turn amount is controlled by burst duration, not by lowering speed.
   align_settle_s: 0.4
   align_turn_speed: 330.0
   align_turn_s_per_px: 0.0015
-  align_turn_s_per_skew: 4.0
+  align_turn_s_per_skew: 2.2
   align_turn_min_s: 0.15
   align_turn_max_s: 0.5
-  align_forward_s: 0.2
+  align_forward_s: 0.15
   align_search_burst_s: 0.3
   align_info_stale_s: 1.5
   # Launch gate from /yolo/bridge_align. Require square and uncropped before
   # handing off to RAMP_APPROACH.
   align_min_shape_conf: 0.4
-  align_skew_tolerance: 0.08
-  approach_speed: 120.0
-  approach_forward_s: 0.2
+  align_skew_tolerance: 0.12
+  approach_speed: 260.0
+  approach_forward_s: 0.15
   approach_done_area: 0.15   # ramp fills this much of bottom half → close enough, classify bears
   approach_timeout_s: 300.0
 
@@ -327,9 +328,9 @@ bear:
   # does not read vision while moving, but no single burst should be a 6 cm lunge
   # near the bear.
   # FIELD FINDING (2026-06-13): the body collides with the bear at ~0.33 m YOLO
-  # depth (after which the bear is shoved out of frame). 2026-06-14 tune: 0.37
-  # stopped too far for the claw, so commit closer while staying above collision.
-  grab_target_distance_m: 0.35
+  # depth (after which the bear is shoved out of frame). 0.37 stopped a bit far,
+  # but 0.35 leaves less margin; use 0.36 as the conservative closer target.
+  grab_target_distance_m: 0.36
   # grab_commit_forward_seconds: DEPRECATED — superseded by the gap-bounded
   # stop-and-look creep above (the old timed open-loop push drove the body through the bear).
   grab_commit_forward_speed: 220.0
@@ -341,6 +342,12 @@ bear:
   # incline's raised stall floor; scoped here so visual servo / final approach / probe
   # keep using slow_speed. Drops back to grab_commit_forward_speed once near.
   climb_forward_speed: 450.0
+  # Blocking bears are under/near the bridge entrance, not on the ramp climb.
+  # Use one-tick, low-speed nudges so losing bbox cannot launch the car onto the bridge.
+  clear_blocking_forward_speed: 220.0
+  clear_blocking_forward_s: 0.10
+  clear_lost_backup_speed: 220.0
+  clear_lost_backup_seconds: 0.8
   # 0 = stop fully before/while the arm grabs. Was 120 (a forward creep to fight
   # gravity pulling the chassis back on the ramp), but the IK target is sampled
   # ONCE at trigger from the YOLO marker, then the car kept creeping for the full
