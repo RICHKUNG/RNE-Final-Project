@@ -329,8 +329,9 @@ bear:
   # near the bear.
   # FIELD FINDING (2026-06-13): the body collides with the bear at ~0.33 m YOLO
   # depth (after which the bear is shoved out of frame). 0.37 stopped a bit far,
-  # but 0.35 leaves less margin; use 0.36 as the conservative closer target.
-  grab_target_distance_m: 0.36
+  # but 0.35 leaves less margin; 0.36 was the conservative closer target.
+  # 2026-06-14 (Mr.Kung): stop a touch farther from the bear → 0.38 (~5 cm margin).
+  grab_target_distance_m: 0.38
   # grab_commit_forward_seconds: DEPRECATED — superseded by the gap-bounded
   # stop-and-look creep above (the old timed open-loop push drove the body through the bear).
   grab_commit_forward_speed: 220.0
@@ -416,7 +417,12 @@ bear:
   # Set false to restore the full verify chain (probe + depth-stability check).
   skip_grasp_verify: false
   verify_retry_on_ground: true
-  grab_retry_max: 2          # used only when verify_retry_on_ground=true
+  # 2026-06-14 (Mr.Kung): cancelled the retry cap. <0 = unlimited verify
+  # retries — a failed verify no longer fails the mission ("grab failed after
+  # N failed verifies"); it re-servos and re-grabs until the bear locks (the
+  # servo_timeout_s budget still bounds a fully-lost bear). Set back to 2 to
+  # restore the bounded cap. Only used when verify_retry_on_ground=true.
+  grab_retry_max: -1
   # 2026-06-13: widened lock tolerances. A grabbed bear is held ~0.3 m on the
   # claw and is LIFTED, so its pixel_y jumps well above the pre-grab lock; the
   # old 180 px gate dropped the locked candidate ("no locked candidate") and

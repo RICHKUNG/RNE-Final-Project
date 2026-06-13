@@ -2289,15 +2289,19 @@ class ScriptedFinalMission(Node):
 
         self._grab_retries += 1
         max_retries = int(b.get("grab_retry_max", 2))
-        if self._grab_retries > max_retries:
+        # max_retries < 0 cancels the cap: verify retries forever instead of
+        # failing the mission (the servo_timeout_s budget still bounds a run
+        # where the bear is lost entirely).
+        if max_retries >= 0 and self._grab_retries > max_retries:
             self._fail(
                 f"grab failed after {self._grab_retries} failed verifies — {reason}"
             )
             return
 
+        cap_text = "∞" if max_retries < 0 else str(max_retries)
         self.get_logger().warn(
             f"[GRASP_RAMP_BEAR] {reason} — retry "
-            f"{self._grab_retries}/{max_retries}"
+            f"{self._grab_retries}/{cap_text}"
         )
         self._phase_goto(5 if restore_probe else 0)
 
