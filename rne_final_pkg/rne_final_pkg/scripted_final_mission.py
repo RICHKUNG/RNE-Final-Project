@@ -151,6 +151,14 @@ class ScriptedFinalMission(Node):
         self._auto_grab_t0 = None
         self._auto_grab_marker = None
         self._bear_commit_t0 = None
+        # Bear-servo stop-and-look sub-FSM (deadtime-immune alignment under the
+        # ~0.3 s camera latency). SETTLE = stop & wait for the image to catch up
+        # then read; TURN/FORWARD/SEARCH = timed open-loop bursts with no vision
+        # read. _servo_burst_s / _servo_burst_cmd parametrise the active burst.
+        self._servo_sub = "SETTLE"
+        self._servo_sub_t0 = time.monotonic()
+        self._servo_burst_s = 0.0
+        self._servo_burst_cmd = 0.0
         self._grasp_verify_depth0 = None
         self._grasp_verify_seq0 = None
         self._grasp_verify_samples = []
@@ -1247,76 +1255,113 @@ class ScriptedFinalMission(Node):
             self.car.publish_velocities(hold_speed, hold_speed)
         return True
 
+    def _servo_enter_burst(self, sub, dur, cmd):
+        """Arm a sub-state and ACTUATE it immediately.
+
+        The control loop ticks at 10 Hz (0.1 s). A burst whose duration is shorter
+        than one tick would otherwise never publish — by the next tick sub_elapsed
+        already exceeds it, so the burst block transitions straight back to SETTLE
+        without ever commanding the wheels (the car never turns). Publishing here,
+        at arm time, guarantees at least one actuation regardless of duration."""
+        self._servo_sub = sub
+        self._servo_sub_t0 = time.monotonic()
+        self._servo_burst_s = dur
+        self._servo_burst_cmd = cmd
+        if sub == "FORWARD":
+            self.car.publish_velocities(cmd, cmd)
+        elif sub in ("TURN", "SEARCH"):
+            self.car.publish_velocities(cmd, -cmd)
+        else:  # SETTLE
+            self.car.stop()
+
     def _bear_servo_step(self) -> bool:
-        """Align + close on the bear; True when at grab distance.
+        """Align + close on the bear, True at the grab pose. Stop-and-look stepper.
+
+        The camera→YOLO chain lags ~0.3 s, so any move-while-watching loop (bang-
+        bang OR PD) commands against a stale dx and limit-cycles — it can't be
+        tuned away, the deadtime is too large. This samples vision ONLY while
+        stationary and settled (so the reading is current), then commits ONE
+        open-loop burst (rotate toward the bear, or a short forward creep), stops,
+        and re-measures. No feedback while moving → immune to the latency. Worst-
+        case forward overshoot is bounded by a single creep step, not by the lag.
         Calls _fail on servo timeout."""
         b = self.cfg["bear"]
         slow = self.cfg["control"]["slow_speed"]
         turn = self.cfg["control"]["turn_slow_speed"]
-        elapsed = time.monotonic() - self._phase_t0
+        align_th = b["align_threshold_px"]
+        grab_target = b.get("grab_target_distance_m", b["grab_distance_m"])
 
-        if elapsed > b["servo_timeout_s"]:
-            self._fail(f"bear servo timeout after {elapsed:.0f}s in {self._state.name}")
+        if time.monotonic() - self._phase_t0 > b["servo_timeout_s"]:
+            self._fail(f"bear servo timeout in {self._state.name}")
             return False
 
-        if not self.yolo.bear_visible():
-            self._bear_commit_t0 = None
-            self.get_logger().info(
-                f"[{self._state.name}] bear lost ({elapsed:.1f}s) → rotate CW search"
-            )
-            self.car.publish_velocities(turn, -turn)
+        # One-shot sub-FSM init on phase entry — begin by settling.
+        if not self._phase_entered:
+            self._phase_entered = True
+            self._servo_enter_burst("SETTLE", 0.0, 0.0)
+
+        sub_elapsed = time.monotonic() - self._servo_sub_t0
+
+        # --- open-loop bursts: drive blind for the armed duration, no vision read ---
+        if self._servo_sub in ("TURN", "FORWARD", "SEARCH"):
+            if sub_elapsed < self._servo_burst_s:
+                if self._servo_sub == "FORWARD":
+                    self.car.publish_velocities(self._servo_burst_cmd, self._servo_burst_cmd)
+                else:  # TURN / SEARCH are in-place rotations (left = -right)
+                    self.car.publish_velocities(self._servo_burst_cmd, -self._servo_burst_cmd)
+                return False
+            self._servo_enter_burst("SETTLE", 0.0, 0.0)  # burst done → re-settle
             return False
 
-        age = self.yolo.bear_age_s()
-        if age is None or age > b.get("grab_info_stale_s", 0.7):
-            self._bear_commit_t0 = None
-            age_text = "none" if age is None else f"{age:.2f}s"
-            self.get_logger().info(
-                f"[{self._state.name}] bear info stale (age={age_text}) → rotate CW search"
-            )
-            self.car.publish_velocities(turn, -turn)
+        # --- SETTLE: stop, wait for the image to catch up, then read & decide ---
+        self.car.stop()
+        if sub_elapsed < b.get("align_settle_s", 0.4):
+            return False
+
+        if not self.yolo.bear_visible() or self.yolo.bear_age_s() is None:
+            self.get_logger().info(f"[{self._state.name}] bear not visible after settle → search")
+            self._servo_enter_burst("SEARCH", b.get("align_search_burst_s", 0.3), turn)
             return False
 
         dx = self.yolo.bear_delta_x()
         d = self.yolo.bear_distance()
+        at_depth = 0 < d <= grab_target
+        # At grab depth, accept a generous alignment band — the arm's IK targets
+        # the bear's 3-D marker, which tolerates a small pixel offset, and the
+        # minimum executable turn (one ~0.1 s tick) can exceed a few-pixel error,
+        # so a tight band here just micro-turns forever. While still approaching,
+        # hold the tight band so the car doesn't drift off-centre.
+        band = b.get("grab_align_threshold_px", align_th) if at_depth else align_th
 
-        # Closed-loop final approach: STOP the instant depth reaches
-        # grab_target_distance_m (see note above — never blind-push through the
-        # bear at ~0.33 m).
-        grab_target = b.get("grab_target_distance_m", b["grab_distance_m"])
-        if 0 < d <= grab_target:
+        # 1) Outside the band → one rotate burst toward the bear, sized by |dx|.
+        if abs(dx) > band:
+            dur = min(b.get("align_turn_max_s", 0.5),
+                      max(b.get("align_turn_min_s", 0.15),
+                          abs(dx) * b.get("align_turn_s_per_px", 0.0015)))
+            cmd = math.copysign(b.get("align_turn_speed", 260.0), dx)
+            self.get_logger().info(
+                f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m → TURN {dur:.2f}s @{cmd:+.0f}"
+            )
+            self._servo_enter_burst("TURN", dur, cmd)
+            return False
+
+        # 2) Within band + at grab depth → done.
+        if at_depth:
+            self.get_logger().info(
+                f"[{self._state.name}] settled aligned dx={dx:.0f}px d={d:.2f}m → stop & grab"
+            )
             self._bear_commit_t0 = None
             self.car.stop()
-            self.get_logger().info(
-                f"[{self._state.name}] grab target reached d={d:.2f}m "
-                f"(<= {grab_target:.2f}m) → stop & grab"
-            )
             return True
 
-        # Forward base speed: creep inside grab_distance_m, slow otherwise.
-        if 0 < d < b["grab_distance_m"]:
-            base = b.get("grab_commit_forward_speed", slow)
-        else:
-            base = slow
-
-        # Proportional ARC steering instead of in-place pivots. The Unity car
-        # can't rotate in place below ~250 (stall floor), so a fixed pivot step
-        # overshoots the align band every tick and oscillates with large
-        # amplitude. Steering while creeping forward converges smoothly.
-        align_th = b["align_threshold_px"]
-        if abs(dx) <= align_th:
-            steer = 0.0
-        else:
-            gain = b.get("align_steer_gain", 1.0)
-            smax = b.get("align_steer_max", 200.0)
-            steer = max(-smax, min(smax, gain * (dx - math.copysign(align_th, dx))))
-        # dx>0 = bear right of center → turn right (left wheel faster).
-        self._bear_commit_t0 = None
-        self.car.publish_velocities(base + steer, base - steer)
+        # 3) Aligned but not close (or depth invalid) → one short forward creep.
+        near = 0 < d < b["grab_distance_m"]
+        base = b.get("grab_commit_forward_speed", slow) if near else slow
+        dur = b.get("align_forward_near_s", 0.15) if near else b.get("align_forward_far_s", 0.3)
         self.get_logger().info(
-            f"[{self._state.name}] servo dx={dx:.0f}px d={d:.2f}m "
-            f"base={base:.0f} steer={steer:+.0f}"
+            f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m → FWD {dur:.2f}s @{base:.0f}"
         )
+        self._servo_enter_burst("FORWARD", dur, base)
         return False
 
     def _state_clear_blocking_bear(self, next_state):

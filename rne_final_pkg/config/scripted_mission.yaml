@@ -4,7 +4,7 @@
 init:
   # Max seconds to wait in INIT for localization pose + required YOLO topics.
   # On timeout the mission FAILS loudly instead of starting blind.
-  wait_timeout_s: 15.0
+  wait_timeout_s: 600
   # Pose older than this (seconds) counts as lost → mission stops and complains.
   pose_stale_s: 2.0
   # Hands-off start: if AMCL has no pose after initial_pose_wait_s, publish
@@ -49,27 +49,27 @@ route:
   # quaternion; yaw_deg kept in the comment for reference).
   long_side_observe:   # car faces ≈ -x, scanning the ramp from the long side
     - x: 3
-      y: 2.3993529864074534
+      y: 2.4
       yaw: -3.14    # yaw_deg -173.50
       tolerance: 0.25
     - x: 3
-      y: 1.5115117995190306
+      y: 1.5
       yaw: -3.14     # yaw_deg -178.91
       tolerance: 0.25
     - x: 3
-      y: 0.9010239171932514
+      y: 0.9
       yaw: -3.14     # yaw_deg -178.75
       tolerance: 0.25
   short_side_observe:  # car faces ≈ +y, scanning the ramp from the short side
-    - x: 1.8089964857296893
+    - x: 2.1
       y: 0
       yaw: 1.57      # yaw_deg 89.21
       tolerance: 0.25
-    - x: 1.54922645232404
+    - x: 1.6
       y: 0
       yaw: 1.57     # yaw_deg 96.66
       tolerance: 0.25
-    - x: 0.89347816558855
+    - x: 0.9
       y: 0
       yaw: 1.57      # yaw_deg 98.17
       tolerance: 0.25
@@ -90,7 +90,7 @@ route:
 control:
   fast_speed: 700.0
   medium_speed: 450.0      # used for route legs
-  slow_speed: 400.0        # used for visual servo / final approach
+  slow_speed: 350.0        # used for visual servo / final approach
   turn_speed: 400.0
   turn_slow_speed: 400.0   # near-target rotation; 150 stalls in-place turns in Unity, 250 works
   turn_slowdown_deg: 20.0  # yaw error below this → rotate at turn_slow_speed (anti-overshoot)
@@ -135,7 +135,7 @@ knob_servo:
   # the settled depth also sizes the pre-press forward leg (see press_standoff_m).
   commit_settle_s: 0.5
   center_threshold_px: 40.0
-  max_seconds: 20.0          # total servo budget; exceeded → FAILED (fail loud)
+  max_seconds: 600.0          # total servo budget; exceeded → FAILED (fail loud)
   invalid_depth_fail_s: 2.0  # knob centered but depth invalid for this long → FAILED
 
 door_press:
@@ -231,7 +231,7 @@ ramp:
   align_timeout_s: 15.0              # ramp not reacquired this long → go to approach anyway
   approach_speed: 120.0
   approach_done_area: 0.15   # ramp fills this much of bottom half → close enough, classify bears
-  approach_timeout_s: 30.0
+  approach_timeout_s: 300.0
 
 bear:
   # Classification: blocking bear = low in frame AND close.
@@ -241,20 +241,45 @@ bear:
   blocking_area_threshold: 0.05
   classify_observe_seconds: 1.5
   align_threshold_px: 50.0
-  # ARC steering for the final bear approach (replaces in-place pivots, which
-  # overshoot the align band and oscillate — the Unity car stalls rotating in
-  # place below ~250). Outside align_threshold_px, the car creeps forward while
-  # steering proportionally to the pixel offset beyond the band:
-  #   steer = clamp(align_steer_gain * (|dx| - align_threshold_px), align_steer_max)
-  # left/right = base ± steer. Bigger gain = sharper turn (risk: re-introduces
-  # oscillation); bigger max = harder max turn. Lower both if it still swings.
-  align_steer_gain: 1.0
-  align_steer_max: 200.0
+  # Generous alignment band applied ONLY at grab depth: the arm IK targets the
+  # bear's 3-D marker (tolerant of a small pixel offset) and the minimum one-tick
+  # turn can exceed a few-pixel error, so demanding the tight align_threshold_px
+  # at the very end just micro-turns forever. Must be ≥ align_threshold_px.
+  grab_align_threshold_px: 75.0
+  # STOP-AND-LOOK bear servo (deadtime-immune). The camera→YOLO chain lags ~0.3 s,
+  # so any move-while-watching loop (bang-bang or PD) commands against a stale dx
+  # and limit-cycles — untunable, the deadtime is too large. Instead the car only
+  # reads dx/depth while STOPPED AND SETTLED, then commits ONE open-loop burst
+  # (rotate toward the bear, or a short forward creep), stops, and re-measures.
+  # Cycle: SETTLE → (TURN if |dx|>align_threshold_px) → SETTLE → (FORWARD if not
+  # yet at grab depth) → … → grab once aligned AND at depth.
+  #
+  # Settle MUST exceed the camera latency, else the read is still stale.
+  align_settle_s: 0.4
+  # In-place rotate speed for a TURN burst (must clear the Unity ~250 stall floor).
+  # 330 needed on the ramp where gravity raises the effective stall threshold.
+  align_turn_speed: 330.0
+  # TURN burst duration = clamp(|dx| * align_turn_s_per_px, min, max). Bigger
+  # s_per_px = more turn per pixel (faster convergence, risk of overshooting the
+  # band in one step → an extra back-and-forth settle). Tune so a centred-ish dx
+  # lands inside align_threshold_px in 1-2 bursts.
+  align_turn_s_per_px: 0.0015
+  # MUST exceed the 10 Hz control-loop period (0.1 s): a burst shorter than one
+  # tick was being skipped before it ever published a wheel command (the car
+  # never turned, dx stuck). 0.15 = ~1.5 ticks, the floor for a turn that runs.
+  align_turn_min_s: 0.15
+  align_turn_max_s: 0.5
+  # FORWARD creep burst durations: shorter when inside grab_distance_m so one step
+  # can't cross the grab_target→collision margin (~0.04 m); longer when still far.
+  align_forward_near_s: 0.15
+  align_forward_far_s: 0.3
+  # Re-acquire rotate burst when the bear isn't visible after a settle.
+  align_search_burst_s: 0.3
   # Lowers the published /clicked_point target below the bear marker so the
   # gripper descends from above (top-down grab). Applied on this (mission) side;
   # arm_controller_2D's own offset is 0.0. Larger = gripper aims lower; 0.0 =
   # aim straight at the marker. Tune on flat ground with get_bear first.
-  grab_z_offset_m: 0.0
+  grab_z_offset_m: 0.6
   # Auto-grab starts only when the bear is freshly visible, centered within
   # align_threshold_px, and strictly closer than this depth.
   grab_distance_m: 0.4
@@ -279,7 +304,10 @@ bear:
   # CAVEAT: if the car now back-slides on the ramp during the grab, restore a
   # small value (e.g. 60) rather than the old 120.
   grab_hold_forward_speed: 0.0
-  grab_info_stale_s: 0.7
+  # 2026-06-13: 0.7→0.3. The servo acts on the freshest dx; a 0.7 s-old reading
+  # added phase lag that fed the oscillation. Tighten so stale frames trigger the
+  # search/hold branch instead of a confidently-wrong turn.
+  grab_info_stale_s: 0.3
   # Safe arm precondition before publishing target_point/clicked_point to auto_arm.
   # Direct /robot_arm degrees, calibrated from /robot_arm echo:
   # [0.0, 141.0, 90.0] = raised claw pose that avoids sweeping through the bear.

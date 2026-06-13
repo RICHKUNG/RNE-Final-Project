@@ -1,0 +1,50 @@
+# Config for bridge_align.py — shape-based ramp/bridge entry alignment.
+# Consumes /yolo/bridge_align (published by yolo_example_pkg/object_detect.py):
+#   [found, center_delta_x(px), skew_score, full_area_ratio, angle_hint, shape_conf]
+# ALL thresholds below are starting guesses — CALIBRATE in Unity before a real run.
+
+perception:
+  # Mask must fill at least this fraction of the full frame to be trusted; below
+  # this the ramp is too far / too small to align against → SEARCH.
+  min_full_area_ratio: 0.02
+  # shape_conf (from the perception layer) below this → skew is ignored this tick
+  # (mask cropped or too short). Centroid centring still runs.
+  min_shape_conf: 0.4
+  # EMA smoothing factor for center_delta_x / skew (seg ~1 Hz, so keep it light).
+  # smoothed = ema*new + (1-ema)*prev.
+  ema: 0.5
+  # A fresh /yolo/bridge_align message older than this (s) counts as lost.
+  info_stale_s: 1.5
+  # Require this many consecutive valid seg messages before driving DEYAW, so a
+  # single noisy frame does not trigger an in-place wobble (cf. ramp found_required_frames).
+  valid_required_frames: 2
+
+control:
+  # CENTER: bring the mask centroid to the image centre.
+  center_px: 50.0          # |center_delta_x| below this = centred
+  center_hysteresis_px: 20.0   # must exceed center_px+this to re-enter CENTER from ADVANCE
+
+  # DEYAW: null the residual centreline skew once centred.
+  skew_enter: 0.08         # |skew_score| above this enters DEYAW
+  skew_exit: 0.04          # falls below this to leave DEYAW (hysteresis band)
+
+  # Wheel speeds. NOTE: the Unity car STALLS rotating in place below ~250
+  # (scripted_mission.yaml notes 150 stalls, 250 works) — keep turn speeds high.
+  center_turn_speed: 300.0   # in-place rotate to centre the centroid
+  deyaw_turn_speed: 280.0    # slow in-place micro-rotate to null yaw
+  advance_speed: 120.0       # forward creep once centred + de-yawed
+  # ADVANCE uses arc steering (not in-place pivots, which overshoot and oscillate
+  # — cf. the bear approach align_steer_gain). steer scales with skew beyond band:
+  #   steer = clamp(advance_steer_gain * |skew| * width_scale, advance_steer_max)
+  advance_steer_gain: 1500.0   # px-ish per unit skew; tune against oscillation
+  advance_steer_max: 200.0
+
+done:
+  # Crossing is "engaged" once the mask fills this much of the frame (near edge
+  # reached) — hand back to the caller / start CROSS. Placeholder.
+  full_area_ratio: 0.20
+
+timeouts:
+  search_s: 12.0     # no usable mask this long → FAILED (fail loud)
+  align_s: 25.0      # never reach DONE within this → FAILED
+  search_turn_speed: 280.0   # slow scan rotation while hunting for the mask
