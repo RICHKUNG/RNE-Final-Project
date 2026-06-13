@@ -1336,9 +1336,6 @@ class ScriptedFinalMission(Node):
 
         if self._phase == 0:
             self._classify_entries += 1
-            if self._classify_entries > 5:
-                self._fail("bear classification looped 5× without a stable result")
-                return
             self._phase_goto(1)
             return
 
