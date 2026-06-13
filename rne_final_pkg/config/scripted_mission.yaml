@@ -367,7 +367,7 @@ bear:
   safe_pre_arm_pose_deg: [0.0, 141.0, 90.0]
   # Auto grab wrist/second-axis offset applied inside pros_car's arm_controller_2D.
   # Positive tilts the claw more forward from the IK pose.
-  grab_wrist_forward_offset_deg: 30.0
+  grab_wrist_forward_offset_deg: 25.0
   # Close-range bbox/marker can disappear while the arm raises; hold the grab-pose
   # target snapshot briefly so CLEAR_BEAR does not oscillate forward/backward.
   grab_snapshot_max_age_s: 2.0
@@ -437,12 +437,14 @@ return:
   # "off-bridge" and sent the car into an in-place rotate on the ramp. z is no
   # help either: map->base_footprint is ground-projected (z≈0 on a ramp per
   # REP-120) and AMCL is 2D, so yaw is the only reliable on-bridge signal.
-  #   horizontal / long-side bridge (yaw near ±180°) → drive forward 1.0 m
-  #   vertical / short-side bridge (yaw near +90°)   → reverse 1.5 m
+  # Code mode names are yaw-based:
+  #   horizontal (yaw near ±180°) → forward 1.0 m
+  #   vertical   (yaw near +90°)  → reverse straight to the saved short-side observe point
   bridge_yaw_select_threshold_deg: 55.0
   bridge_exit_speed: 300.0
   horizontal_forward_m: 1.0
-  vertical_reverse_m: 1.5
+  vertical_reverse_m: 1.5     # fallback only if no saved observe point exists
+  observe_reverse_max_extra_m: 0.3
   drop_at_origin: true       # false = hold the bear at origin until task trigger
   drop_wait_seconds: 2.0
   back_away_seconds: 1.0

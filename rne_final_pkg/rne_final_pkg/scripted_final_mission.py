@@ -198,6 +198,9 @@ class ScriptedFinalMission(Node):
         self._grasp_verify_probe_m = 0.0
         self._grasp_verify_lock = None
         self._return_exit_mode = None
+        self._return_reverse_wp = None
+        self._return_reverse_start_dist = None
+        self._return_reverse_wp_label = None
         self._press_attempts = 0
         self._knob_invalid_t0 = None
         self._servo_settle_t0 = None     # knob servo: in-window settle timer
@@ -343,6 +346,9 @@ class ScriptedFinalMission(Node):
         self._bear_last_settle_depth = None
         self._bear_depth_jump_rejected = False
         self._clear_lost_state = None
+        self._return_reverse_wp = None
+        self._return_reverse_start_dist = None
+        self._return_reverse_wp_label = None
 
     def _phase_goto(self, phase: int):
         self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
@@ -2326,10 +2332,12 @@ class ScriptedFinalMission(Node):
     def _select_return_exit_mode(self):
         """Choose how to leave the bridge before routing home.
 
-        Horizontal bridge: robot yaw is near ±180° after the grab; drive forward
-        down the bridge first. Vertical bridge: yaw is near +90°; reverse down
-        the bridge first. Fall back to the outbound orientation flag when yaw is
-        not close to either expected heading.
+        Code mode names follow the robot yaw:
+        - "horizontal": yaw near ±180°, keep the legacy forward exit.
+        - "vertical": yaw near +90°, reverse straight back to the observe point
+          used to enter the ramp.
+        Fall back to the outbound orientation flag when yaw is not close to
+        either expected heading.
         """
         cfg = self.cfg["return"]
         if self.pose is None:
@@ -2345,6 +2353,58 @@ class ScriptedFinalMission(Node):
         if vertical_err < horizontal_err and vertical_err <= threshold:
             return "vertical"
         return "horizontal" if self._bridge_horizontal else "vertical"
+
+    def _return_observe_waypoint(self):
+        move_state = self._ramp_reacquire_state
+        if move_state == S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE:
+            chain = self.cfg["route"]["long_side_observe"]
+            side = "long"
+        elif move_state == S.MOVE_TO_RAMP_OBSERVE_SHORT_SIDE:
+            chain = self.cfg["route"]["short_side_observe"]
+            side = "short"
+        else:
+            return None, "unknown"
+
+        if not chain:
+            return None, side
+        idx = max(0, min(self._observe_idx, len(chain) - 1))
+        return chain[idx], f"{side} observe point {idx + 1}/{len(chain)}"
+
+    def _reverse_straight_to_point(self, wp, label, speed):
+        x, y = wp["x"], wp["y"]
+        tol = wp.get("tolerance", self.cfg["control"]["xy_tolerance"])
+        px, py, yaw = self.pose
+        dist = math.hypot(x - px, y - py)
+        travelled = self._dist_from_anchor()
+
+        if dist <= tol:
+            self.car.stop()
+            self.get_logger().info(
+                f"[RETURN] reached {label} ({dist:.2f}m <= {tol:.2f}m) → origin route"
+            )
+            return True
+
+        if self._return_reverse_start_dist is not None:
+            max_extra = self.cfg["return"].get("observe_reverse_max_extra_m", 0.30)
+            if travelled > self._return_reverse_start_dist + max_extra:
+                self.car.stop()
+                self.get_logger().warn(
+                    f"[RETURN] reverse to {label} overshot guard "
+                    f"(travelled={travelled:.2f}m, start_dist={self._return_reverse_start_dist:.2f}m) "
+                    "→ origin route"
+                )
+                return True
+
+        bearing = math.atan2(y - py, x - px)
+        reverse_err = _norm_ang(bearing - (yaw + math.pi))
+        self.car.publish_velocities(-abs(speed), -abs(speed))
+        self.get_logger().info(
+            f"[RETURN] reverse to {label} "
+            f"pose=({px:.2f},{py:.2f},{math.degrees(yaw):.0f}°/{self._pose_src}) "
+            f"target=({x:.2f},{y:.2f}) dist={dist:.2f}m travelled={travelled:.2f}m "
+            f"rev_heading_err={math.degrees(reverse_err):.0f}° → BACKWARD"
+        )
+        return False
 
     def _state_return_origin(self, next_state):
         r = self.cfg["return"]
@@ -2367,12 +2427,39 @@ class ScriptedFinalMission(Node):
                     f"[RETURN] bridge exit mode={self._return_exit_mode} "
                     f"yaw={math.degrees(yaw):.0f}° (yaw-based; XY ignored)"
                 )
+                if self._return_exit_mode == "vertical":
+                    wp, label = self._return_observe_waypoint()
+                    self._return_reverse_wp = wp
+                    self._return_reverse_wp_label = label
+                    if wp is not None:
+                        self._return_reverse_start_dist = math.hypot(
+                            wp["x"] - x,
+                            wp["y"] - y,
+                        )
+                        self.get_logger().info(
+                            f"[RETURN] reverse exit target={label} "
+                            f"x={wp['x']:.2f} y={wp['y']:.2f} "
+                            f"start_dist={self._return_reverse_start_dist:.2f}m"
+                        )
+                    else:
+                        self.get_logger().warn(
+                            "[RETURN] reverse exit has no saved observe point; "
+                            "falling back to configured reverse distance"
+                        )
 
             if self._return_exit_mode == "horizontal":
-                target = r.get("horizontal_forward_m", r.get("horizontal_reverse_m", 1.0))
+                target = r.get("horizontal_forward_m", 1.0)
                 speed = r["bridge_exit_speed"]
                 action = "FORWARD"
             else:
+                if self._return_reverse_wp is not None:
+                    if self._reverse_straight_to_point(
+                        self._return_reverse_wp,
+                        self._return_reverse_wp_label,
+                        r["bridge_exit_speed"],
+                    ):
+                        self._phase_goto(1)
+                    return
                 target = r.get("vertical_reverse_m", r.get("vertical_forward_m", 1.5))
                 speed = -r["bridge_exit_speed"]
                 action = "BACKWARD"
