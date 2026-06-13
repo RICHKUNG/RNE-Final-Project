@@ -153,6 +153,7 @@ class ScriptedFinalMission(Node):
         self._phase_t0 = time.monotonic()
         self._phase_entered = False  # one-shot flag for phase entry actions
         self._anchor = None          # per-state scratch (target yaw / start xy …)
+        self._clear_turn_target = None  # CLEAR_BLOCKING_BEAR 180° deposit-turn target yaw
         self._fail_reason = None
         self._done_logged = False
 
@@ -2067,7 +2068,7 @@ class ScriptedFinalMission(Node):
                 return
 
             if elapsed_after_trigger > b["grab_wait_seconds"]:
-                self._phase_goto(2)
+                self._phase_goto(3)   # no backup: deposit by turning 180° in place
 
         elif self._phase == 2:     # back away from the ramp entrance
             self.car.publish_velocities(
