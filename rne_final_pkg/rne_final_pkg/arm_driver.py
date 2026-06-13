@@ -59,12 +59,32 @@ class ArmDriver:
     def _publish(self):
         self._publish_positions(self._joint_pos)
 
+    def _full_joint_pos(self):
+        positions = list(RESET_POS)
+        count = min(len(self._joint_pos), len(positions))
+        positions[:count] = self._joint_pos[:count]
+        return positions
+
+    def _merge_positions(self, positions):
+        merged = self._full_joint_pos()
+        count = min(len(positions), len(merged))
+        merged[:count] = list(positions[:count])
+        if len(positions) > len(merged):
+            merged.extend(positions[len(merged):])
+        return merged
+
     def reset(self):
         self._joint_pos = list(RESET_POS)
         self._publish()
 
     def stow(self):
+        self._joint_pos = self._merge_positions(STOW_POS)
         self._publish_positions(STOW_POS)
+
+    def stow_closed(self):
+        self._joint_pos = self._merge_positions(STOW_POS)
+        self._joint_pos[-1] = GRIPPER_CLOSED
+        self._publish()
 
     def safe_pre_arm_pose(self, angles_deg=None):
         positions = (
@@ -72,21 +92,30 @@ class ArmDriver:
             if angles_deg is not None
             else list(SAFE_PRE_ARM_POSE)
         )
+        self._joint_pos = self._merge_positions(positions)
         self._publish_positions(positions)
 
     def subscriber_count(self):
         return self._pub.get_subscription_count()
 
     def open_gripper(self):
+        self._joint_pos = self._full_joint_pos()
         self._joint_pos[-1] = GRIPPER_OPEN
         self._publish()
 
     def close_gripper(self):
+        self._joint_pos = self._full_joint_pos()
         self._joint_pos[-1] = GRIPPER_CLOSED
         self._publish()
 
     def set_angles_deg(self, *angles_deg):
-        self._joint_pos = _deg(*angles_deg)
+        positions = _deg(*angles_deg)
+        self._joint_pos = self._merge_positions(positions)
+        self._publish_positions(positions)
+
+    def set_angles_deg_closed(self, *angles_deg):
+        self._joint_pos = self._merge_positions(_deg(*angles_deg))
+        self._joint_pos[-1] = GRIPPER_CLOSED
         self._publish()
 
     def auto_grab(self):
@@ -105,18 +134,26 @@ class ArmDriver:
     def auto_grab_marker(self, marker, z_offset=0.0):
         """Publish a cached target marker as /clicked_point, which triggers auto_arm.
 
-        z_offset (m) lowers the published target so the gripper descends onto the
-        bear from above (top-down grab). Applied here in the marker frame (map),
-        which equals lowering it in arm_ik_base as long as their z-axes are
-        parallel (true for an upright arm on flat ground). arm_controller_2D's own
-        offset is 0.0, so this is the single source of the grab z-offset.
+        z_offset (m) is only applied when marker.z is a vertical axis. YOLO bear
+        markers are published in camera_optical_frame, where z is forward depth;
+        subtracting a "lowering" offset there moves the target behind the camera.
         """
         pt = PointStamped()
         pt.header.frame_id = marker.header.frame_id
         pt.header.stamp = self._node.get_clock().now().to_msg()
         pt.point.x = marker.pose.position.x
         pt.point.y = marker.pose.position.y
-        pt.point.z = marker.pose.position.z - z_offset
+        pt.point.z = marker.pose.position.z
+
+        frame = marker.header.frame_id or ""
+        vertical_z_frames = {"map", "odom", "base_link", "base_footprint", "arm_ik_base"}
+        if z_offset and frame in vertical_z_frames:
+            pt.point.z -= z_offset
+        elif z_offset:
+            self._node.get_logger().warn(
+                f"[ARM] ignore grab_z_offset_m={z_offset:.3f} in {frame}; "
+                "frame z is not vertical"
+            )
         self._clicked_point_pub.publish(pt)
 
     def grab_sequence(self, x_target=0.15, z_target=0.05):

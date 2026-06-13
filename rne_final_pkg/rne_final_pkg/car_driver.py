@@ -4,7 +4,9 @@ _RATIO = 50
 _V = 6.0 * _RATIO
 _V_SLOW = 3.0 * _RATIO
 _R = 6.0 * _RATIO
-_R_SLOW = 5.0 * _RATIO
+# Unity stalls in-place rotation around 250; keep symbolic slow turns above the
+# measured floor while leaving low forward creeps unchanged.
+_R_SLOW = 6.6 * _RATIO
 
 # [rear_left, rear_right, front_left, front_right]
 ACTION_MAPPINGS = {

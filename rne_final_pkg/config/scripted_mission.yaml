@@ -135,6 +135,15 @@ knob_servo:
   # the settled depth also sizes the pre-press forward leg (see press_standoff_m).
   commit_settle_s: 0.5
   center_threshold_px: 40.0
+  # STOP-AND-LOOK knob servo. Reads dx/depth only while stopped, then commits a
+  # bounded open-loop burst so YOLO/camera latency cannot drive an oscillation.
+  align_settle_s: 0.4
+  align_turn_speed: 330.0
+  align_turn_s_per_px: 0.0015
+  align_turn_min_s: 0.15
+  align_turn_max_s: 0.5
+  align_forward_s: 0.15
+  align_search_burst_s: 0.3
   max_seconds: 600.0          # total servo budget; exceeded → FAILED (fail loud)
   invalid_depth_fail_s: 2.0  # knob centered but depth invalid for this long → FAILED
 
@@ -148,9 +157,11 @@ door_press:
   forward_during_press_m: 0.12
   # Straight-line displacement of the arc push. Door opening angle ≈
   # 2*asin(d / (2*door_width)). Measured 2026-06-12 in Unity: actual door_width ≈ 0.56 m
-  # (not 0.78 m). Calibration: 0.97 m total → 120°; 0.76 m total → ~85° (target).
-  # forward_during_press_m (0.12) + push_after_unlock_m (0.64) = 0.76 m total.
-  push_after_unlock_m: 0.64
+  # (not 0.78 m). Calibration: 0.97 m total → 120°; 0.76 m total → ~85°.
+  # 2026-06-13 field tune: 0.76 m / 3.0 s and 0.90 m / 4.0 s were both too short,
+  # so raise the sanity distance to 1.12 m total and let the timed arc run longer.
+  # forward_during_press_m (0.12) + push_after_unlock_m (1.00) = 1.12 m total.
+  push_after_unlock_m: 1.00
   push_speed: 120.0          # straight segments: pre-press forward, retry backup
   # Arc push toward front-right while the claw holds the knob down. Hinge is
   # on the RIGHT (facing the door), handle on the LEFT, so the handle sweeps
@@ -168,7 +179,7 @@ door_press:
   # push_seconds. TUNE: too far past 90° → lower push_seconds (or push_speed_*);
   # not open enough → raise it. push_after_unlock_m below is now just a sanity
   # early-out, not the primary terminator.
-  push_seconds: 3.0
+  push_seconds: 6.0
   retry_count: 0             # extra unconditional re-presses; door opens first try
   exit_wait_s: 1.0           # hold at route.door_exit_point after the door opens
   # Calibrated 2026-06-12 from /robot_arm echo (3 joints; arm_writer leaves the
@@ -210,9 +221,13 @@ ramp:
   # This catches short-side observations where Foxglove shows the ramp mask
   # higher in the frame but the legacy bottom-half score is still near zero.
   found_area_threshold: 0.01
+  # Observation-chain confirmation only: the ramp mask must overlap the central
+  # 1/3 x 1/3 image box by at least this ratio of that box. This prevents a ramp
+  # mask at the image edge from prematurely ending the observe chain.
+  center_overlap_threshold: 0.01
   info_stale_s: 1.5
-  # Units = distinct seg inferences (~1 Hz; seg runs every SEG_CHECK_INTERVAL
-  # camera frames), NOT 10 Hz control ticks.
+  # Units = distinct seg inferences from the timer-driven segmentation node,
+  # NOT 10 Hz control ticks.
   found_required_frames: 2
   found_window_frames: 6
   # Outbound pre-check (SEGMENT_1, spawn→turn_point): the ramp is seen from far
@@ -229,7 +244,23 @@ ramp:
   align_bottom_target_ratio: 0.95   # edge ≥ this counts as aligned to the bottom
   align_speed: 120.0                 # forward creep speed while closing the gap
   align_timeout_s: 15.0              # ramp not reacquired this long → go to approach anyway
+  # STOP-AND-LOOK ramp alignment. Rotation stays above the Unity in-place stall
+  # floor; turn amount is controlled by burst duration, not by lowering speed.
+  align_settle_s: 0.4
+  align_turn_speed: 330.0
+  align_turn_s_per_px: 0.0015
+  align_turn_s_per_skew: 4.0
+  align_turn_min_s: 0.15
+  align_turn_max_s: 0.5
+  align_forward_s: 0.2
+  align_search_burst_s: 0.3
+  align_info_stale_s: 1.5
+  # Launch gate from /yolo/bridge_align. Require square and uncropped before
+  # handing off to RAMP_APPROACH.
+  align_min_shape_conf: 0.4
+  align_skew_tolerance: 0.08
   approach_speed: 120.0
+  approach_forward_s: 0.2
   approach_done_area: 0.15   # ramp fills this much of bottom half → close enough, classify bears
   approach_timeout_s: 300.0
 
@@ -275,11 +306,11 @@ bear:
   align_forward_far_s: 0.3
   # Re-acquire rotate burst when the bear isn't visible after a settle.
   align_search_burst_s: 0.3
-  # Lowers the published /clicked_point target below the bear marker so the
-  # gripper descends from above (top-down grab). Applied on this (mission) side;
-  # arm_controller_2D's own offset is 0.0. Larger = gripper aims lower; 0.0 =
-  # aim straight at the marker. Tune on flat ground with get_bear first.
-  grab_z_offset_m: 0.6
+  # YOLO bear markers arrive in camera_optical_frame, where z is forward depth,
+  # not vertical height. Keep mission-side offset at 0.0 so the clicked target
+  # stays in front of the camera; arm_controller_2D applies a small post-transform
+  # lowering in arm_ik_base for camera-frame targets.
+  grab_z_offset_m: 0.0
   # Auto-grab starts only when the bear is freshly visible, centered within
   # align_threshold_px, and strictly closer than this depth.
   grab_distance_m: 0.4
@@ -319,14 +350,16 @@ bear:
   # the gripper closes. Matches get_bear_node's grab_wait_seconds. TUNE to the rig.
   grab_wait_seconds: 12.0
   servo_timeout_s: 600.0      # bear lost during servo for this long → FAILED
-  # Auto-retry only after the depth-probe check proves the bear did not move with
-  # the claw. This avoids dropping a successfully-held bear while preventing a
-  # ground bear from being accepted as success.
+  # Auto-retry only while a close bear is still visible after the grab. If the
+  # close target disappears, or YOLO only sees a far/other bear, accept the grab:
+  # the held bear can leave the detector's normal ground-depth geometry.
   verify_retry_on_ground: true
   grab_retry_max: 2          # used only when verify_retry_on_ground=true
-  # Grasp verification: record bear depth, back up a little, then require fresh
-  # /yolo/bear_info depth to stay nearly unchanged. A held bear moves with the
-  # car/camera; a ground bear's depth changes by roughly the probe distance.
+  verify_accept_missing_close_bear: true
+  verify_clear_depth_m: 0.70 # if nearest bear is this far after grab, target is considered cleared
+  # Grasp verification fallback: only when a close bear remains visible, record
+  # depth, back up a little, then retry if the close bear behaves like it stayed
+  # on the ramp instead of being removed by the claw.
   verify_baseline_observe_seconds: 0.3
   verify_probe_distance_m: 0.12
   verify_probe_min_distance_m: 0.06
@@ -342,6 +375,21 @@ bear:
   clear_rotate_seconds: 1.2
 
 return:
+  # Before doing the bridge/ramp exit move, confirm the robot is still on the
+  # bridge by map coordinates. If the current pose is outside all regions below,
+  # RETURN skips the bridge exit and routes directly to origin.
+  # Tune these AABBs from /amcl_pose or TF logs after field calibration.
+  bridge_regions:
+    - name: long_side_bridge
+      x_min: 1.80
+      x_max: 3.20
+      y_min: 0.55
+      y_max: 1.20
+    - name: short_side_bridge
+      x_min: 1.45
+      x_max: 2.35
+      y_min: -0.15
+      y_max: 1.20
   # Before driving home, leave the bridge/ramp in the safe direction:
   #   horizontal / long-side bridge (yaw near ±180°) → drive forward 1.0 m
   #   vertical / short-side bridge (yaw near +90°)   → reverse 1.5 m

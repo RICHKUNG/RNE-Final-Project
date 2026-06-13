@@ -57,6 +57,7 @@ class S(Enum):
     TASK3_KNOB_SERVO = auto()
     TASK3_DOOR_PRESS_COMMIT = auto()
     TASK3_TURN_FORWARD = auto()          # turn left back to yaw≈0 (face forward) after the push
+    TASK3_ARM_SAFE_BEFORE_BACKUP = auto()
     BACK_UP_AFTER_TASK3 = auto()         # reverse a fixed distance before ramp search
 
     MOVE_TO_RAMP_OBSERVE_LONG_SIDE = auto()
@@ -83,6 +84,7 @@ class ScriptedFinalMission(Node):
     _SEA_EXEMPT = frozenset({
         S.TASK3_DOOR_PRESS_COMMIT,
         S.TASK3_TURN_FORWARD,
+        S.TASK3_ARM_SAFE_BEFORE_BACKUP,
         S.BACK_UP_AFTER_TASK3,
     })
 
@@ -136,6 +138,7 @@ class ScriptedFinalMission(Node):
         self._ramp_last_seq = None   # last counted seg message (see yolo_client.ramp_seq)
         self._ramp_last_counted = False
         self._ramp_last_hit = False
+        self._ramp_reacquire_state = None
         self._observe_idx = 0        # index into the current side's observe chain
                                      # (survives MOVE→SCAN→MOVE; reset only on side switch)
         self._bridge_horizontal = False  # set if the ramp is seen on the outbound
@@ -239,8 +242,10 @@ class ScriptedFinalMission(Node):
                 self.get_logger().warn("[STOW] arm_writer never subscribed — skipping stow")
                 self._stow_timer.cancel()
             return
-        self.arm.stow()
-        self.get_logger().info(f"[STOW] stow pose published (attempt {self._stow_attempts})")
+        self.arm.stow_closed()
+        self.get_logger().info(
+            f"[STOW] stow + closed claw published (attempt {self._stow_attempts})"
+        )
         self._stow_timer.cancel()
 
     def _amcl_cb(self, msg):
@@ -349,9 +354,11 @@ class ScriptedFinalMission(Node):
             # (map +x, yaw=0) before reversing for the ramp search. Watchdog so a
             # car still jammed on the door doesn't spin here forever.
             self._state_turn_to(
-                0.0, S.BACK_UP_AFTER_TASK3,
+                0.0, S.TASK3_ARM_SAFE_BEFORE_BACKUP,
                 timeout_s=self.cfg["post_task3"]["turn_forward_timeout_s"],
             )
+        elif s == S.TASK3_ARM_SAFE_BEFORE_BACKUP:
+            self._state_task3_arm_safe_before_backup(S.BACK_UP_AFTER_TASK3)
         elif s == S.BACK_UP_AFTER_TASK3:
             # Bridge known horizontal from the outbound leg → skip long-side
             # observe and route right-angle (via long_to_short_corner, the outer
@@ -590,7 +597,7 @@ class ScriptedFinalMission(Node):
     # Task 3 — route, knob servo, door press
     # ------------------------------------------------------------------
 
-    def _accumulate_ramp_hits(self, area_threshold=None) -> int:
+    def _accumulate_ramp_hits(self, area_threshold=None, require_center_overlap=False) -> int:
         """Fold this side's confirmed ramp seg inferences into _ramp_window and
         return the running hit count. Counts distinct seg messages only (seg
         publishes ~1 Hz while this loop ticks at 10 Hz, so a sticky message must
@@ -609,7 +616,16 @@ class ScriptedFinalMission(Node):
         self._ramp_last_seq = seq
         age = self.yolo.ramp_age_s()
         fresh = age is not None and age <= c.get("info_stale_s", 1.5)
-        found = fresh and self.yolo.ramp_visible() and self.yolo.ramp_area_ratio() >= thr
+        center_ok = (
+            not require_center_overlap
+            or self.yolo.ramp_center_overlap_ratio() >= c.get("center_overlap_threshold", 0.01)
+        )
+        found = (
+            fresh
+            and self.yolo.ramp_visible()
+            and self.yolo.ramp_area_ratio() >= thr
+            and center_ok
+        )
         self._ramp_window.append(1 if found else 0)
         self._ramp_last_counted = True
         self._ramp_last_hit = found
@@ -667,22 +683,49 @@ class ScriptedFinalMission(Node):
         return self.yolo.knob_distance()
 
     def _state_knob_servo(self, next_state):
+        if self._knob_servo_step():
+            self._press_attempts = 0
+            self._goto(next_state)
+
+    def _knob_servo_step(self) -> bool:
+        """Stop-and-look knob servo, True once the door press pose is ready.
+
+        The knob detector has enough latency that continuous turn corrections
+        overshoot the centre line.  This mirrors the bear servo pattern: stop,
+        settle, sample one fresh dx/depth, then execute one bounded open-loop
+        burst before measuring again.
+        """
         c = self.cfg["knob_servo"]
         slow = self.cfg["control"]["slow_speed"]
-        # In-place rotation stalls below ~250 in Unity (see turn_slow_speed) —
-        # slow_speed (200) is for forward motion only.
-        turn = self.cfg["control"]["turn_slow_speed"]
+        turn = c.get("align_turn_speed", self.cfg["control"]["turn_slow_speed"])
         elapsed = time.monotonic() - self._state_t0
         if elapsed > c["max_seconds"]:
             self._fail(f"knob servo timeout after {elapsed:.0f}s (knob_visible={self._knob_visible()})")
-            return
+            return False
+
+        if not self._phase_entered:
+            self._phase_entered = True
+            self._knob_invalid_t0 = None
+            self._servo_settle_t0 = None
+            self._servo_enter_burst("SETTLE", 0.0, 0.0)
+
+        if self._servo_burst_active():
+            return False
+
+        sub_elapsed = time.monotonic() - self._servo_sub_t0
+        self.car.stop()
+        if sub_elapsed < c.get("align_settle_s", 0.4):
+            return False
 
         if not self._knob_visible():
             self._knob_invalid_t0 = None
             self._servo_settle_t0 = None
-            self.get_logger().info(f"[KNOB_SERVO] no knob ({elapsed:.1f}s) → rotate CW search")
-            self.car.publish_velocities(turn, -turn)
-            return
+            dur = c.get("align_search_burst_s", 0.3)
+            self.get_logger().info(
+                f"[KNOB_SERVO] no knob after settle ({elapsed:.1f}s) → SEARCH {dur:.2f}s @{turn:.0f}"
+            )
+            self._servo_enter_burst("SEARCH", dur, turn)
+            return False
 
         dx = self._knob_dx()
         depth = self._knob_depth()
@@ -690,9 +733,15 @@ class ScriptedFinalMission(Node):
         if abs(dx) > c["center_threshold_px"]:
             self._knob_invalid_t0 = None
             self._servo_settle_t0 = None
-            self.get_logger().info(f"[KNOB_SERVO] dx={dx:.0f}px depth={depth:.2f}m → rotate")
-            self._rotate_dir(-dx, speed=turn)   # dx>0 = knob right of center → CW
-            return
+            dur = min(c.get("align_turn_max_s", 0.5),
+                      max(c.get("align_turn_min_s", 0.15),
+                          abs(dx) * c.get("align_turn_s_per_px", 0.0015)))
+            cmd = math.copysign(turn, dx)  # dx>0 = knob right of centre → CW
+            self.get_logger().info(
+                f"[KNOB_SERVO] settled dx={dx:.0f}px depth={depth:.2f}m → TURN {dur:.2f}s @{cmd:+.0f}"
+            )
+            self._servo_enter_burst("TURN", dur, cmd)
+            return False
 
         # centered — close in on depth
         if depth <= 0:
@@ -705,27 +754,30 @@ class ScriptedFinalMission(Node):
             self.get_logger().warn(f"[KNOB_SERVO] knob centered but depth invalid ({held:.1f}s)")
             if held > c["invalid_depth_fail_s"]:
                 self._fail("knob centered but depth stayed invalid — cannot range the door")
-            return
+            return False
         self._knob_invalid_t0 = None
 
         if depth > c["target_depth_m"]:
             self._servo_settle_t0 = None
+            dur = c.get("align_forward_s", 0.15)
             self.get_logger().info(
-                f"[KNOB_SERVO] centered dx={dx:.0f}px  depth={depth:.2f}m > {c['target_depth_m']}m → FORWARD_SLOW"
+                f"[KNOB_SERVO] settled dx={dx:.0f}px  depth={depth:.2f}m > "
+                f"{c['target_depth_m']}m → FWD {dur:.2f}s @{slow:.0f}"
             )
-            self.car.publish_velocities(slow, slow)
-            return
+            self._servo_enter_burst("FORWARD", dur, slow)
+            return False
 
         # Too close — the press pose is calibrated at target_depth_m, so back
         # up until depth is inside [target - tol, target] before committing.
         if depth < c["target_depth_m"] - c["depth_tolerance_m"]:
             self._servo_settle_t0 = None
+            dur = c.get("align_forward_s", 0.15)
             self.get_logger().info(
-                f"[KNOB_SERVO] centered dx={dx:.0f}px  depth={depth:.2f}m < "
-                f"{c['target_depth_m'] - c['depth_tolerance_m']:.2f}m → BACKWARD_SLOW"
+                f"[KNOB_SERVO] settled dx={dx:.0f}px  depth={depth:.2f}m < "
+                f"{c['target_depth_m'] - c['depth_tolerance_m']:.2f}m → BACK {dur:.2f}s @{slow:.0f}"
             )
-            self.car.publish_velocities(-slow, -slow)
-            return
+            self._servo_enter_burst("FORWARD", dur, -slow)
+            return False
 
         # In the window — stop and settle before committing: the depth message
         # lags the camera and the car coasts after stop, so the first in-window
@@ -737,17 +789,17 @@ class ScriptedFinalMission(Node):
             self.get_logger().info(
                 f"[KNOB_SERVO] in window  dx={dx:.0f}px  depth={depth:.2f}m → settling"
             )
-            return
+            return False
         if now - self._servo_settle_t0 < c["commit_settle_s"]:
-            return
+            return False
 
         self.get_logger().info(
             f"[KNOB_SERVO] aligned  dx={dx:.0f}px  depth={depth:.2f}m (settled) "
             "→ commit (camera goes blind now)"
         )
         self._press_commit_depth = depth
-        self._press_attempts = 0
-        self._goto(next_state)
+        self.car.stop()
+        return True
 
     def _dist_from_anchor(self):
         if self._anchor is None or self.pose is None:
@@ -907,6 +959,19 @@ class ScriptedFinalMission(Node):
                 )
                 self._goto(next_state)
 
+    def _state_task3_arm_safe_before_backup(self, next_state):
+        c = self.cfg["door_press"]
+        elapsed = time.monotonic() - self._phase_t0
+        if not self._phase_entered:
+            self._phase_entered = True
+            self.get_logger().info(
+                f"[TASK3_ARM_SAFE] raise arm + close claw before backup: {c['arm_raise_deg']}"
+            )
+            self.arm.set_angles_deg_closed(*c["arm_raise_deg"])
+        self.car.stop()
+        if elapsed > c["arm_settle_s"]:
+            self._goto(next_state)
+
     def _state_back_up(self, distance_m, speed, next_state):
         """Reverse straight back `distance_m` (pose-measured) before continuing.
         Run after the door opens to clear the doorway so the ramp comes into
@@ -923,6 +988,7 @@ class ScriptedFinalMission(Node):
         travelled = math.hypot(px - ax, py - ay)
         if travelled >= distance_m:
             self.car.stop()
+            self.arm.stow()
             self.get_logger().info(
                 f"[BACK_UP_AFTER_TASK3] backed up {travelled:.2f}m → {next_state.name}"
             )
@@ -967,7 +1033,7 @@ class ScriptedFinalMission(Node):
         self.car.stop()
         idx = self._observe_idx
 
-        hits = self._accumulate_ramp_hits()
+        hits = self._accumulate_ramp_hits(require_center_overlap=True)
         elapsed = time.monotonic() - self._state_t0
         age = self.yolo.ramp_age_s()
         age_text = "n/a" if age is None else f"{age:.1f}s"
@@ -983,11 +1049,13 @@ class ScriptedFinalMission(Node):
             f"(seg msgs seen={len(self._ramp_window)}, {sample_text})  "
             f"seq={self.yolo.ramp_seq()} found={int(self.yolo.ramp_visible())} age={age_text}  "
             f"area={self.yolo.ramp_area_ratio():.3f} "
-            f"(bottom={self.yolo.ramp_bottom_area_ratio():.3f}, full={self.yolo.ramp_full_area_ratio():.3f})  "
+            f"(bottom={self.yolo.ramp_bottom_area_ratio():.3f}, full={self.yolo.ramp_full_area_ratio():.3f}, "
+            f"center={self.yolo.ramp_center_overlap_ratio():.3f})  "
             f"elapsed={elapsed:.1f}/{c['scan_seconds']:.0f}s"
         )
 
         if hits >= c["found_required_frames"]:
+            self._ramp_reacquire_state = move_state
             self.get_logger().info(f"[{self._state.name}] ramp confirmed → {found_next.name}")
             self._goto(found_next)
             return
@@ -1010,49 +1078,131 @@ class ScriptedFinalMission(Node):
             else:
                 self._fail("ramp not found from any observation point")
 
+    def _return_to_ramp_observe(self, label, reason):
+        move_state = self._ramp_reacquire_state
+        if move_state is None:
+            self.get_logger().warn(
+                f"[{label}] {reason}; no saved observe state, staying put"
+            )
+            self.car.stop()
+            return
+        self.car.stop()
+        self.get_logger().warn(
+            f"[{label}] {reason} → return to observe point "
+            f"{self._observe_idx + 1} ({move_state.name})"
+        )
+        self._goto(move_state)
+
+    def _ramp_align_fresh(self, c) -> bool:
+        age = self.yolo.align_age_s()
+        return (
+            self.yolo.align_visible()
+            and age is not None
+            and age <= c.get("align_info_stale_s", c.get("info_stale_s", 1.5))
+        )
+
+    def _ramp_turn_burst(self, label, err, scale):
+        c = self.cfg["ramp"]
+        turn = c.get("align_turn_speed", self.cfg["control"]["turn_slow_speed"])
+        dur = min(c.get("align_turn_max_s", 0.5),
+                  max(c.get("align_turn_min_s", 0.15), abs(err) * scale))
+        cmd = math.copysign(turn, err if err != 0.0 else 1.0)
+        self.get_logger().info(f"[{label}] TURN {dur:.2f}s @{cmd:+.0f}")
+        self._servo_enter_burst("TURN", dur, cmd)
+
     def _state_ramp_align_bottom(self, next_state):
         """Visual servo the ramp mask's near edge down to the bottom of the
-        camera frame before the approach. Center on the ramp (dx) first, then
-        creep forward until the published bottom-edge ratio reaches the target;
-        getting closer pushes the near edge lower in the frame. On timeout,
-        proceed to the approach anyway rather than failing — the approach has
-        its own search/forward logic."""
+        camera frame before the approach. Center on the ramp (dx), square up
+        with /yolo/bridge_align skew, then creep forward until the bottom edge
+        reaches the target. A cropped or skewed mask is not allowed to launch."""
         c = self.cfg["ramp"]
-        slow = self.cfg["control"]["turn_slow_speed"]
+        turn = c.get("align_turn_speed", self.cfg["control"]["turn_slow_speed"])
         elapsed = time.monotonic() - self._state_t0
 
-        if not self.yolo.ramp_visible():
-            if elapsed > c["align_timeout_s"]:
-                self.get_logger().warn(
-                    f"[RAMP_ALIGN_BOTTOM] ramp not reacquired in {elapsed:.0f}s → {next_state.name}"
-                )
-                self.car.stop()
-                self._goto(next_state)
-                return
-            self.get_logger().info(f"[RAMP_ALIGN_BOTTOM] ramp lost ({elapsed:.1f}s) → rotate CW search")
-            self.car.publish_velocities(slow, -slow)
+        if not self._phase_entered:
+            self._phase_entered = True
+            self._servo_enter_burst("SETTLE", 0.0, 0.0)
+
+        if self._servo_burst_active():
             return
 
-        dx = self.yolo.ramp_delta_x()
+        sub_elapsed = time.monotonic() - self._servo_sub_t0
+        self.car.stop()
+        if sub_elapsed < c.get("align_settle_s", 0.4):
+            return
+
+        if not self.yolo.ramp_visible():
+            self._return_to_ramp_observe(
+                "RAMP_ALIGN_BOTTOM",
+                f"ramp lost after settle ({elapsed:.1f}s)",
+            )
+            return
+
+        align_fresh = self._ramp_align_fresh(c)
+        dx = self.yolo.align_center_dx() if align_fresh else self.yolo.ramp_delta_x()
         edge = self.yolo.ramp_bottom_edge_ratio()
+        shape_conf = self.yolo.align_shape_conf() if align_fresh else 0.0
+        skew = self.yolo.align_skew() if align_fresh else 0.0
+        angle = self.yolo.align_angle_hint() if align_fresh else 0.0
 
         if abs(dx) > c["center_threshold_px"]:
             self.get_logger().info(
-                f"[RAMP_ALIGN_BOTTOM] dx={dx:.0f}px edge={edge:.2f} → rotate to center"
+                f"[RAMP_ALIGN_BOTTOM] settled dx={dx:.0f}px edge={edge:.2f} "
+                f"shape={shape_conf:.2f} skew={skew:.3f} → center"
             )
-            self._rotate_dir(-dx, speed=slow)
+            self._ramp_turn_burst(
+                "RAMP_ALIGN_BOTTOM",
+                dx,
+                c.get("align_turn_s_per_px", 0.0015),
+            )
+            return
+
+        min_shape = c.get("align_min_shape_conf", 0.4)
+        skew_tol = c.get("align_skew_tolerance", 0.08)
+        if align_fresh and shape_conf >= min_shape and abs(skew) > skew_tol:
+            self.get_logger().info(
+                f"[RAMP_ALIGN_BOTTOM] centered edge={edge:.2f} shape={shape_conf:.2f} "
+                f"skew={skew:.3f} angle={angle:+.3f} → square"
+            )
+            self._ramp_turn_burst(
+                "RAMP_ALIGN_BOTTOM",
+                angle if abs(angle) > 0.001 else skew,
+                c.get("align_turn_s_per_skew", 4.0),
+            )
             return
 
         if edge < c["align_bottom_target_ratio"]:
+            dur = c.get("align_forward_s", 0.2)
             self.get_logger().info(
-                f"[RAMP_ALIGN_BOTTOM] edge={edge:.2f} < {c['align_bottom_target_ratio']} → forward"
+                f"[RAMP_ALIGN_BOTTOM] centered edge={edge:.2f} < "
+                f"{c['align_bottom_target_ratio']} shape={shape_conf:.2f} "
+                f"skew={skew:.3f} → FWD {dur:.2f}s @{c['align_speed']:.0f}"
             )
-            v = c["align_speed"]
-            self.car.publish_velocities(v, v)
+            self._servo_enter_burst("FORWARD", dur, c["align_speed"])
+            return
+
+        if not align_fresh:
+            dur = c.get("align_search_burst_s", 0.3)
+            self.get_logger().info(
+                f"[RAMP_ALIGN_BOTTOM] bridge_align stale/missing at launch gate → SEARCH {dur:.2f}s @{turn:.0f}"
+            )
+            self._servo_enter_burst("SEARCH", dur, turn)
+            return
+
+        if shape_conf < min_shape:
+            dur = c.get("align_search_burst_s", 0.3)
+            hint = dx if abs(dx) > 1.0 else (angle if abs(angle) > 0.001 else 1.0)
+            cmd = math.copysign(turn, hint)
+            self.get_logger().info(
+                f"[RAMP_ALIGN_BOTTOM] edge ready but mask cropped/weak "
+                f"shape={shape_conf:.2f} < {min_shape:.2f} → TURN {dur:.2f}s @{cmd:+.0f}"
+            )
+            self._servo_enter_burst("TURN", dur, cmd)
             return
 
         self.get_logger().info(
-            f"[RAMP_ALIGN_BOTTOM] near edge at frame bottom (edge={edge:.2f}) → {next_state.name}"
+            f"[RAMP_ALIGN_BOTTOM] launch gate OK edge={edge:.2f} "
+            f"shape={shape_conf:.2f} skew={skew:.3f} → {next_state.name}"
         )
         self.car.stop()
         self._goto(next_state)
@@ -1065,7 +1215,27 @@ class ScriptedFinalMission(Node):
             self._fail(f"ramp approach timeout after {elapsed:.0f}s")
             return
 
-        # A close bear takes priority over ramp alignment
+        if not self._phase_entered:
+            self._phase_entered = True
+            self._servo_enter_burst("SETTLE", 0.0, 0.0)
+
+        if self._servo_burst_active():
+            return
+
+        sub_elapsed = time.monotonic() - self._servo_sub_t0
+        self.car.stop()
+        if sub_elapsed < c.get("align_settle_s", 0.4):
+            return
+
+        if not self.yolo.ramp_visible():
+            self._return_to_ramp_observe(
+                "RAMP_APPROACH",
+                f"ramp lost after settle ({elapsed:.1f}s)",
+            )
+            return
+
+        # A close bear takes priority over ramp alignment only while the ramp
+        # mask is still visible; otherwise re-acquire from the observe chain.
         if self.yolo.bear_visible() and 0 < self.yolo.bear_distance() < b["blocking_depth_threshold_m"]:
             self.get_logger().info(
                 f"[RAMP_APPROACH] bear at {self.yolo.bear_distance():.2f}m → classify"
@@ -1074,14 +1244,8 @@ class ScriptedFinalMission(Node):
             self._goto(S.RAMP_BEAR_CLASSIFY)
             return
 
-        if not self.yolo.ramp_visible():
-            self.get_logger().info(f"[RAMP_APPROACH] ramp lost ({elapsed:.1f}s) → rotate CW search")
-            s = self.cfg["control"]["turn_slow_speed"]
-            self.car.publish_velocities(s, -s)
-            return
-
         area = self.yolo.ramp_area_ratio()
-        dx = self.yolo.ramp_delta_x()
+        dx = self.yolo.align_center_dx() if self._ramp_align_fresh(c) else self.yolo.ramp_delta_x()
 
         if area >= c["approach_done_area"]:
             self.get_logger().info(f"[RAMP_APPROACH] area={area:.3f} ≥ {c['approach_done_area']} → classify")
@@ -1091,12 +1255,19 @@ class ScriptedFinalMission(Node):
             return
 
         if abs(dx) > c["center_threshold_px"]:
-            self.get_logger().info(f"[RAMP_APPROACH] dx={dx:.0f}px area={area:.3f} → rotate")
-            self._rotate_dir(-dx, speed=self.cfg["control"]["turn_slow_speed"])
-        else:
-            self.get_logger().info(f"[RAMP_APPROACH] aligned  area={area:.3f} → forward")
-            v = c["approach_speed"]
-            self.car.publish_velocities(v, v)
+            self.get_logger().info(f"[RAMP_APPROACH] settled dx={dx:.0f}px area={area:.3f} → center")
+            self._ramp_turn_burst(
+                "RAMP_APPROACH",
+                dx,
+                c.get("align_turn_s_per_px", 0.0015),
+            )
+            return
+
+        dur = c.get("approach_forward_s", c.get("align_forward_s", 0.2))
+        self.get_logger().info(
+            f"[RAMP_APPROACH] settled aligned area={area:.3f} → FWD {dur:.2f}s @{c['approach_speed']:.0f}"
+        )
+        self._servo_enter_burst("FORWARD", dur, c["approach_speed"])
 
     # ------------------------------------------------------------------
     # Bear classification / handling
@@ -1170,12 +1341,33 @@ class ScriptedFinalMission(Node):
         )
         self._goto(S.CLEAR_BLOCKING_BEAR if blocking else S.GRASP_RAMP_BEAR)
 
-    def _bear_grab_ready(self):
+    def _bear_visible(self, group=None):
+        if group == "blocking":
+            return self.yolo.blocking_bear_visible()
+        if group == "ramp":
+            return self.yolo.ramp_bear_visible()
+        return self.yolo.bear_visible()
+
+    def _bear_distance(self, group=None):
+        if group == "blocking":
+            return self.yolo.blocking_bear_distance()
+        if group == "ramp":
+            return self.yolo.ramp_bear_distance()
+        return self.yolo.bear_distance()
+
+    def _bear_delta_x(self, group=None):
+        if group == "blocking":
+            return self.yolo.blocking_bear_delta_x()
+        if group == "ramp":
+            return self.yolo.ramp_bear_delta_x()
+        return self.yolo.bear_delta_x()
+
+    def _bear_grab_ready(self, group=None):
         b = self.cfg["bear"]
         age = self.yolo.bear_age_s()
-        visible = self.yolo.bear_visible()
-        d = self.yolo.bear_distance()
-        dx = self.yolo.bear_delta_x()
+        visible = self._bear_visible(group)
+        d = self._bear_distance(group)
+        dx = self._bear_delta_x(group)
         fresh = age is not None and age <= b.get("grab_info_stale_s", 0.7)
         ready = (
             visible
@@ -1186,8 +1378,8 @@ class ScriptedFinalMission(Node):
         )
         return ready, d, dx, age
 
-    def _target_marker_ready(self):
-        marker = self.yolo.marker()
+    def _target_marker_ready(self, group=None):
+        marker = self.yolo.marker(group)
         if marker is None:
             return False, None
         add_action = getattr(marker, "ADD", 0)
@@ -1195,20 +1387,20 @@ class ScriptedFinalMission(Node):
             return False, marker
         return True, marker
 
-    def _auto_grab_precondition_step(self, label: str):
+    def _auto_grab_precondition_step(self, label: str, group=None):
         b = self.cfg["bear"]
         settle_s = b.get("pre_arm_settle_s", 0.5)
         hold_speed = b.get("grab_hold_forward_speed", 0.0)
 
         if not self._phase_entered:
-            ready, d, dx, age = self._bear_grab_ready()
-            marker_ok, marker = self._target_marker_ready()
+            ready, d, dx, age = self._bear_grab_ready(group)
+            marker_ok, marker = self._target_marker_ready(group)
             if not ready or not marker_ok:
                 age_text = "none" if age is None else f"{age:.2f}s"
                 marker_state = "ok" if marker_ok else "missing/delete"
                 self.get_logger().warn(
                     f"[{label}] grab gate rejected "
-                    f"(visible={self.yolo.bear_visible()} d={d:.2f}m "
+                    f"(group={group or 'overall'} visible={self._bear_visible(group)} d={d:.2f}m "
                     f"dx={dx:.0f}px age={age_text} marker={marker_state}) → re-servo"
                 )
                 self._phase_goto(0)
@@ -1237,10 +1429,10 @@ class ScriptedFinalMission(Node):
                 self.car.stop()
             if time.monotonic() - self._phase_t0 < settle_s:
                 return False
-            marker_ok, marker = self._target_marker_ready()
+            marker_ok, marker = self._target_marker_ready(group)
             if not marker_ok:
                 self.get_logger().warn(
-                    f"[{label}] target marker missing at trigger → re-servo"
+                    f"[{label}] {group or 'overall'} target marker missing at trigger → re-servo"
                 )
                 self._phase_goto(0)
                 return False
@@ -1274,7 +1466,28 @@ class ScriptedFinalMission(Node):
         else:  # SETTLE
             self.car.stop()
 
-    def _bear_servo_step(self) -> bool:
+    def _servo_burst_active(self) -> bool:
+        """Run an armed open-loop burst.
+
+        Returns True when the caller should skip perception work this tick.  A
+        finished burst is converted back to SETTLE and also returns True, so the
+        next tick gets a full settle interval before reading vision.
+        """
+        if self._servo_sub not in ("TURN", "FORWARD", "SEARCH"):
+            return False
+
+        sub_elapsed = time.monotonic() - self._servo_sub_t0
+        if sub_elapsed < self._servo_burst_s:
+            if self._servo_sub == "FORWARD":
+                self.car.publish_velocities(self._servo_burst_cmd, self._servo_burst_cmd)
+            else:
+                self.car.publish_velocities(self._servo_burst_cmd, -self._servo_burst_cmd)
+            return True
+
+        self._servo_enter_burst("SETTLE", 0.0, 0.0)
+        return True
+
+    def _bear_servo_step(self, group=None) -> bool:
         """Align + close on the bear, True at the grab pose. Stop-and-look stepper.
 
         The camera→YOLO chain lags ~0.3 s, so any move-while-watching loop (bang-
@@ -1318,13 +1531,15 @@ class ScriptedFinalMission(Node):
         if sub_elapsed < b.get("align_settle_s", 0.4):
             return False
 
-        if not self.yolo.bear_visible() or self.yolo.bear_age_s() is None:
-            self.get_logger().info(f"[{self._state.name}] bear not visible after settle → search")
+        if not self._bear_visible(group) or self.yolo.bear_age_s() is None:
+            self.get_logger().info(
+                f"[{self._state.name}] {group or 'overall'} bear not visible after settle → search"
+            )
             self._servo_enter_burst("SEARCH", b.get("align_search_burst_s", 0.3), turn)
             return False
 
-        dx = self.yolo.bear_delta_x()
-        d = self.yolo.bear_distance()
+        dx = self._bear_delta_x(group)
+        d = self._bear_distance(group)
         at_depth = 0 < d <= grab_target
         # At grab depth, accept a generous alignment band — the arm's IK targets
         # the bear's 3-D marker, which tolerates a small pixel offset, and the
@@ -1369,11 +1584,22 @@ class ScriptedFinalMission(Node):
         elapsed = time.monotonic() - self._phase_t0
 
         if self._phase == 0:       # servo to the blocking bear
-            if self._bear_servo_step():
+            if self._phase_entered and self._servo_sub == "SETTLE":
+                sub_elapsed = time.monotonic() - self._servo_sub_t0
+                if sub_elapsed >= b.get("align_settle_s", 0.4):
+                    if not self._bear_visible("blocking") or self.yolo.bear_age_s() is None:
+                        self.car.stop()
+                        self.get_logger().info(
+                            "[CLEAR_BEAR] blocking bear not visible after settle "
+                            f"→ skip to {next_state.name}"
+                        )
+                        self._goto(next_state)
+                        return
+            if self._bear_servo_step("blocking"):
                 self._phase_goto(1)
 
         elif self._phase == 1:     # pre-arm, target_point, auto-arm grab (async)
-            if self._auto_grab_precondition_step("CLEAR_BEAR"):
+            if self._auto_grab_precondition_step("CLEAR_BEAR", "blocking"):
                 elapsed_after_trigger = time.monotonic() - self._auto_grab_t0
             else:
                 return
@@ -1450,6 +1676,10 @@ class ScriptedFinalMission(Node):
         elapsed = time.monotonic() - self._phase_t0
 
         if self._phase == 0:       # servo to the ramp bear
+            # After the car climbs onto the ramp, the ramp mask often leaves the
+            # camera view. The ramp-specific bear group then disappears even
+            # though the bear itself is still visible, so keep tracking the
+            # committed bear target through the overall target stream.
             if self._bear_servo_step():
                 self._phase_goto(1)
 
@@ -1479,11 +1709,31 @@ class ScriptedFinalMission(Node):
             valid, seq, d, py, age = self._fresh_bear_depth()
             if not valid:
                 age_text = "none" if age is None else f"{age:.2f}s"
-                self._retry_grasp_or_fail(
-                    f"no valid bear depth before probe "
-                    f"(visible={self.yolo.bear_visible()} d={d:.2f}m age={age_text})",
-                    restore_probe=False,
+                if b.get("verify_accept_missing_close_bear", True):
+                    self.get_logger().info(
+                        "[GRASP_RAMP_BEAR] grasp OK — no close bear visible after grab "
+                        f"(visible={self.yolo.bear_visible()} d={d:.2f}m age={age_text}) "
+                        f"→ {next_state.name}"
+                    )
+                    self._grab_retries = 0
+                    self._goto(next_state)
+                else:
+                    self._retry_grasp_or_fail(
+                        f"no valid bear depth before probe "
+                        f"(visible={self.yolo.bear_visible()} d={d:.2f}m age={age_text})",
+                        restore_probe=False,
+                    )
+                return
+
+            clear_depth = b.get("verify_clear_depth_m", 0.70)
+            if d >= clear_depth:
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] grasp OK — close target no longer on ramp "
+                    f"(nearest bear d={d:.2f}m >= {clear_depth:.2f}m py={py:.0f}) "
+                    f"→ {next_state.name}"
                 )
+                self._grab_retries = 0
+                self._goto(next_state)
                 return
 
             self._grasp_verify_depth0 = d
@@ -1562,8 +1812,17 @@ class ScriptedFinalMission(Node):
             delta = abs(avg_d - depth0)
             tolerance = b.get("verify_depth_stable_tolerance_m", 0.05)
             arm_depth_th = b.get("verify_arm_depth_threshold", 0.35)
+            clear_depth = b.get("verify_clear_depth_m", 0.70)
 
-            if delta <= tolerance and avg_d < arm_depth_th:
+            if avg_d >= clear_depth:
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] grasp OK — probe sees only far/other bear "
+                    f"(d0={depth0:.2f}m d1={avg_d:.2f}m py={avg_py:.0f}) "
+                    f"→ {next_state.name}"
+                )
+                self._grab_retries = 0
+                self._goto(next_state)
+            elif delta <= tolerance and avg_d < arm_depth_th:
                 self.get_logger().info(
                     f"[GRASP_RAMP_BEAR] grasp OK — depth stable after probe "
                     f"(d0={depth0:.2f}m d1={avg_d:.2f}m Δ={delta:.2f}m "
@@ -1631,6 +1890,25 @@ class ScriptedFinalMission(Node):
             return "vertical"
         return "horizontal" if self._bridge_horizontal else "vertical"
 
+    def _return_bridge_region(self):
+        """Return the matched bridge coordinate region, or None if off-bridge."""
+        if self.pose is None:
+            return None
+
+        regions = self.cfg["return"].get("bridge_regions")
+        if not regions:
+            return {"name": "unconfigured"}
+
+        px, py, _ = self.pose
+        for region in regions:
+            x_min = float(region.get("x_min", -math.inf))
+            x_max = float(region.get("x_max", math.inf))
+            y_min = float(region.get("y_min", -math.inf))
+            y_max = float(region.get("y_max", math.inf))
+            if x_min <= px <= x_max and y_min <= py <= y_max:
+                return region
+        return None
+
     def _state_return_origin(self, next_state):
         r = self.cfg["return"]
         elapsed = time.monotonic() - self._phase_t0
@@ -1639,11 +1917,23 @@ class ScriptedFinalMission(Node):
             if not self._require_pose():
                 return
             if self._anchor is None:
+                region = self._return_bridge_region()
+                if region is None:
+                    x, y, yaw = self.pose
+                    self.car.stop()
+                    self.get_logger().info(
+                        f"[RETURN] pose=({x:.2f},{y:.2f},{math.degrees(yaw):.0f}°) "
+                        "is outside bridge coordinate regions → origin route"
+                    )
+                    self._phase_goto(1)
+                    return
+
                 self._anchor = self.pose[:2]
                 self._return_exit_mode = self._select_return_exit_mode()
+                region_name = region.get("name", "unnamed")
                 self.get_logger().info(
                     f"[RETURN] bridge exit mode={self._return_exit_mode} "
-                    f"yaw={math.degrees(self.pose[2]):.0f}°"
+                    f"region={region_name} yaw={math.degrees(self.pose[2]):.0f}°"
                 )
 
             if self._return_exit_mode == "horizontal":
