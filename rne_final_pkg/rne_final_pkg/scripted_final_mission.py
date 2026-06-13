@@ -1399,6 +1399,14 @@ class ScriptedFinalMission(Node):
                 and avg_d < b["blocking_depth_threshold_m"]
             )
             basis = f"fallback depth={avg_d:.2f}m pixel_y={avg_py:.0f}"
+        if blocking and self._ramp_aligned:
+            # Post-align we've committed to grasping the ramp bear; clearing is a
+            # pre-align concern. At close range the bridge bear looks "blocking"
+            # (near + low in frame / center_y below a stale ramp line), so any
+            # blocking verdict here is a misclassification — treat it as the ramp
+            # bear instead of looping back through CLEAR_BLOCKING_BEAR.
+            blocking = False
+            basis += " (post-align→ramp, blocking suppressed)"
         if blocking:
             decision = "BLOCKING_BEAR"
             next_state = S.CLEAR_BLOCKING_BEAR
@@ -1456,6 +1464,15 @@ class ScriptedFinalMission(Node):
         age = self.yolo.bear_age_s()
         if age is None or age > b.get("grab_info_stale_s", 0.7):
             return None, False
+
+        # Once aligned on the ramp, the blocking/ramp split is unreliable at
+        # close range: the bridge bear drops low in frame and the ramp mask may
+        # be stale/out of view, so the publisher mislabels it as a blocking bear
+        # and the grab keeps diverting to CLEAR_BLOCKING_BEAR (GRASP↔CLEAR loop).
+        # We've already committed to this ramp bear, so target the ramp group if
+        # present, else the overall-nearest bear, and never interrupt to clear.
+        if self._ramp_aligned:
+            return ("ramp" if self.yolo.ramp_bear_visible() else None), False
 
         if self.yolo.blocking_bear_visible():
             self.car.stop()

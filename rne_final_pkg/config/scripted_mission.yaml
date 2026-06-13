@@ -397,7 +397,7 @@ bear:
   grab_direct_lift_s: 1.0      # wait for the lift to complete
   # Auto grab wrist/second-axis offset applied inside pros_car's arm_controller_2D.
   # Positive tilts the claw more forward from the IK pose.
-  grab_wrist_forward_offset_deg: 30.0
+  grab_wrist_forward_offset_deg: 40.0
   # Close-range bbox/marker can disappear while the arm raises; hold the grab-pose
   # target snapshot briefly so CLEAR_BEAR does not oscillate forward/backward.
   grab_snapshot_max_age_s: 2.0
