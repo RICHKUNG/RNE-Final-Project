@@ -264,6 +264,17 @@ ramp:
   approach_forward_s: 0.15
   approach_done_area: 0.15   # ramp fills this much of bottom half → close enough, classify bears
   approach_timeout_s: 300.0
+  # Aggressive charge mode for RAMP_APPROACH. The stop-and-look approach reverses
+  # back to the observe point whenever the ramp mask drops out (the camera tilts
+  # up as the car climbs), which made the car oscillate on the bridge. With
+  # charge_mode on, once RAMP_APPROACH is entered the car commits and drives
+  # straight up charge_distance_m (pose-measured), ignoring transient mask loss,
+  # until the ramp area is reached / a close bear appears / the distance is done.
+  # Knocking a bear over while charging is acceptable.
+  charge_mode: true
+  charge_distance_m: 1.75          # blind forward commit distance from ramp foot to bear
+  charge_speed: 400.0              # strong enough to climb without stalling on the ramp
+  charge_center_threshold_px: 90.0  # only a large dx interrupts the charge for a quick re-center
 
 bear:
   # Classification: blocking bear = low in frame AND close.
@@ -292,8 +303,9 @@ bear:
   # Settle MUST exceed the camera latency, else the read is still stale.
   align_settle_s: 0.4
   # In-place rotate speed for a TURN burst (must clear the Unity ~250 stall floor).
-  # 330 needed on the ramp where gravity raises the effective stall threshold.
-  align_turn_speed: 330.0
+  # 360 on the ramp: 330 cleared the static floor but a min-length 0.12s pulse barely
+  # rotated the car near the band, so band-edge corrections stalled out.
+  align_turn_speed: 360.0
   # TURN burst duration = clamp(|dx| * align_turn_s_per_px, min, max). Bigger
   # s_per_px = more turn per pixel (faster convergence, risk of overshooting the
   # band in one step → an extra back-and-forth settle). Tune so a centred-ish dx
@@ -302,7 +314,10 @@ bear:
   # Slightly above the 10 Hz control-loop period (0.1 s): _servo_enter_burst
   # publishes immediately, and this keeps the minimum turn small enough for the
   # tighter depth-scaled grab band to be reachable.
-  align_turn_min_s: 0.12
+  # 0.18 (was 0.12): a 0.12s min pulse on the ramp barely rotated the car, so small
+  # band-edge dx corrections (|dx|<80px, where s_per_px stays under the floor) never
+  # converged. Longer floor → each TURN actually moves the heading.
+  align_turn_min_s: 0.18
   align_turn_max_s: 0.5
   # FORWARD creep burst durations are caps. Runtime also limits each burst by
   # remaining depth gap (d - grab_target_distance_m), using grab_creep_mps below.
@@ -334,7 +349,7 @@ bear:
   grab_target_distance_m: 0.38
   # 2026-06-14 (Mr.Kung): GRASP_RAMP_BEAR uses its own (closer) servo stop
   # distance; all other grabs keep grab_target_distance_m above.
-  ramp_grab_target_distance_m: 0.35
+  ramp_grab_target_distance_m: 0.38
   # grab_commit_forward_seconds: DEPRECATED — superseded by the gap-bounded
   # stop-and-look creep above (the old timed open-loop push drove the body through the bear).
   grab_commit_forward_speed: 220.0

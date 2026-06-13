@@ -170,6 +170,7 @@ class ScriptedFinalMission(Node):
                                      # straight to the short-side observe chain.
                                      # Persists across _goto (not reset there).
         self._approach_done = False  # ramp approach reached approach_done_area at least once
+        self._charge_anchor = None   # RAMP_APPROACH charge-mode start xy (pose-measured distance)
         self._ramp_aligned = False   # RAMP_ALIGN_BOTTOM cleared its launch gate at least once;
                                      # gates triage classify (pre-align) vs grasp classify (post-align).
                                      # Persists across _goto (not reset there).
@@ -352,6 +353,7 @@ class ScriptedFinalMission(Node):
         self._return_reverse_wp = None
         self._return_reverse_start_dist = None
         self._return_reverse_wp_label = None
+        self._charge_anchor = None
 
     def _phase_goto(self, phase: int):
         self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
@@ -1273,6 +1275,16 @@ class ScriptedFinalMission(Node):
             self._fail(f"ramp approach timeout after {elapsed:.0f}s")
             return
 
+        # Aggressive charge: once committed to the ramp, drive straight up a fixed
+        # pose-measured distance instead of settling + re-observing every tick.
+        # Climbing tilts the camera and drops the ramp mask; the stop-and-look path
+        # below treats that as "ramp lost" and reverses to the observe point, so the
+        # car oscillates back and forth on the bridge. Charging through fixes it
+        # (knocking a bear off is acceptable per mission). See ramp.charge_* config.
+        if c.get("charge_mode", False):
+            self._ramp_charge(c, b, next_state)
+            return
+
         if not self._phase_entered:
             self._phase_entered = True
             self._servo_enter_burst("SETTLE", 0.0, 0.0)
@@ -1328,6 +1340,88 @@ class ScriptedFinalMission(Node):
             f"[RAMP_APPROACH] settled aligned area={area:.3f} → FWD {dur:.2f}s @{c['approach_speed']:.0f}"
         )
         self._servo_enter_burst("FORWARD", dur, c["approach_speed"])
+
+    def _ramp_charge(self, c, b, next_state):
+        """Charge-mode RAMP_APPROACH: commit and drive straight up the ramp.
+
+        Continuous forward at charge_speed (no per-tick settle/stop) until one of:
+          * ramp mask area ≥ approach_done_area  → reached the top, classify
+          * a close bear is in view              → classify (grasp / clear)
+          * charge_distance_m covered            → blind commit done, classify
+        A lost ramp mask while climbing is EXPECTED here and is NOT a reason to
+        reverse — that was the oscillation bug. Light centering only kicks in when
+        the heading error is large (charge_center_threshold_px), reusing the same
+        turn-burst sign convention as the normal approach."""
+        if not self._require_pose():
+            return
+
+        # Let any in-flight centering turn-burst finish before re-reading vision.
+        if self._servo_burst_active():
+            return
+
+        speed = c.get("charge_speed", c["approach_speed"])
+        dist_target = c.get("charge_distance_m", 1.2)
+        center_th = c.get("charge_center_threshold_px", 90.0)
+
+        px, py, _ = self.pose
+        if self._charge_anchor is None:
+            self._charge_anchor = (px, py)
+            self.get_logger().info(
+                f"[RAMP_CHARGE] commit → charge {dist_target:.2f}m @{speed:.0f} "
+                f"(done if area≥{c['approach_done_area']} or bear<{b['blocking_depth_threshold_m']}m)"
+            )
+        ax, ay = self._charge_anchor
+        travelled = math.hypot(px - ax, py - ay)
+
+        ramp_seen = self.yolo.ramp_visible()
+        area = self.yolo.ramp_area_ratio() if ramp_seen else 0.0
+
+        if ramp_seen and area >= c["approach_done_area"]:
+            self.get_logger().info(
+                f"[RAMP_CHARGE] area={area:.3f} ≥ {c['approach_done_area']} "
+                f"travelled={travelled:.2f}m → {next_state.name}"
+            )
+            self.car.stop()
+            self._approach_done = True
+            self._goto(next_state)
+            return
+
+        if self.yolo.bear_visible() and 0 < self.yolo.bear_distance() < b["blocking_depth_threshold_m"]:
+            self.get_logger().info(
+                f"[RAMP_CHARGE] bear at {self.yolo.bear_distance():.2f}m "
+                f"(travelled={travelled:.2f}m) → classify"
+            )
+            self.car.stop()
+            self._goto(S.RAMP_BEAR_CLASSIFY)
+            return
+
+        if travelled >= dist_target:
+            self.get_logger().info(
+                f"[RAMP_CHARGE] charged {travelled:.2f}m ≥ {dist_target:.2f}m → {next_state.name}"
+            )
+            self.car.stop()
+            self._approach_done = True
+            self._goto(next_state)
+            return
+
+        # Light centering: only a large heading error interrupts the charge.
+        if ramp_seen:
+            dx = self.yolo.align_center_dx() if self._ramp_align_fresh(c) else self.yolo.ramp_delta_x()
+            if abs(dx) > center_th:
+                self.get_logger().info(
+                    f"[RAMP_CHARGE] dx={dx:.0f}px > {center_th:.0f} "
+                    f"(travelled={travelled:.2f}m) → re-center"
+                )
+                self._ramp_turn_burst(
+                    "RAMP_CHARGE", dx, c.get("align_turn_s_per_px", 0.0015)
+                )
+                return
+
+        self.get_logger().info(
+            f"[RAMP_CHARGE] FWD travelled={travelled:.2f}/{dist_target:.2f}m "
+            f"ramp={'Y' if ramp_seen else 'N'} area={area:.3f} @{speed:.0f}"
+        )
+        self.car.publish_velocities(speed, speed)
 
     # ------------------------------------------------------------------
     # Bear classification / handling
@@ -1993,7 +2087,7 @@ class ScriptedFinalMission(Node):
                           abs(dx) * b.get("align_turn_s_per_px", 0.0015)))
             cmd = math.copysign(b.get("align_turn_speed", 260.0), dx)
             self.get_logger().info(
-                f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m "
+                f"[{self._state.name}] settled dx={dx:.0f}px d={d_eff:.2f}m "
                 f"band={band:.0f}px → TURN {dur:.2f}s @{cmd:+.0f}"
             )
             self._servo_enter_burst("TURN", dur, cmd)
@@ -2053,7 +2147,7 @@ class ScriptedFinalMission(Node):
         gap_text = "n/a" if not math.isfinite(gap) else f"{gap:.2f}m"
         rate_text = "n/a" if not math.isfinite(mps) else f"{mps:.2f}m/s"
         self.get_logger().info(
-            f"[{self._state.name}] settled dx={dx:.0f}px d={d:.2f}m "
+            f"[{self._state.name}] settled dx={dx:.0f}px d={d_eff:.2f}m "
             f"({branch}, gap={gap_text}, rate={rate_text}) → FWD {dur:.2f}s @{base:.0f}"
         )
         self._servo_enter_burst("FORWARD", dur, base)
