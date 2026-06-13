@@ -97,8 +97,11 @@ class RampBear12(ScriptedFinalMission):
             )
         elif s == S.RAMP_BEAR_CLASSIFY:
             # Classify the bear before aligning: a blocking bear is cleared and
-            # re-classified first; only a confirmed ramp bear proceeds to align.
-            self._state_bear_classify(grasp_state=S.RAMP_ALIGN_BOTTOM)
+            # re-classified first. The pre-align triage already routes a confirmed
+            # ramp bear to RAMP_ALIGN_BOTTOM via the internal _ramp_aligned gate;
+            # once aligned, the post-approach re-classify must proceed to grasp
+            # (passing RAMP_ALIGN_BOTTOM here looped align↔approach forever).
+            self._state_bear_classify(grasp_state=S.GRASP_RAMP_BEAR)
         elif s == S.CLEAR_BLOCKING_BEAR:
             self._state_clear_blocking_bear(
                 S.RAMP_BEAR_CLASSIFY,

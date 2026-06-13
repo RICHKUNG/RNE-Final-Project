@@ -180,6 +180,8 @@ class ScriptedFinalMission(Node):
         self._auto_grab_marker = None
         self._bear_grab_snapshot = None
         self._bear_commit_t0 = None
+        self._direct_grab_phase = 0   # sub-step of the direct close-gripper grab
+        self._direct_grab_t0 = 0.0
         # Bear-servo stop-and-look sub-FSM (deadtime-immune alignment under the
         # ~0.3 s camera latency). SETTLE = stop & wait for the image to catch up
         # then read; TURN/FORWARD/SEARCH = timed open-loop bursts with no vision
@@ -1620,6 +1622,71 @@ class ScriptedFinalMission(Node):
             return None
         return snap
 
+    def _grab_step(self, label: str, group=None) -> bool:
+        """Dispatch to the configured grab: direct close-gripper (default) or IK."""
+        if self.cfg["bear"].get("grab_direct_close", True):
+            return self._direct_grab_step(label, group)
+        return self._auto_grab_precondition_step(label, group)
+
+    def _direct_grab_step(self, label: str, group=None) -> bool:
+        """Direct close-gripper grab for a bear the chassis has driven into (no IK).
+
+        Mr.Kung 2026-06-14: at close range the car bumps the bear, so it is already
+        at the gripper. Skip the IK raise+descend ("舉高爪子再夾"); lower the arm onto
+        the bumped bear with the gripper open, close it, then raise to the same lift
+        pose holding it. Robust where IK on a synthetic/blind-zone marker is not.
+
+        Returns True when the grab+lift is complete (and back-dates _auto_grab_t0 so
+        the caller's grab_wait gate clears immediately — the grab already finished).
+        """
+        b = self.cfg["bear"]
+        grab_pose = b.get("grab_direct_pose_deg", [108.0, 120.0, 90.0])
+        lift_pose = b.get(
+            "grab_direct_lift_deg", b.get("safe_pre_arm_pose_deg", [0.0, 141.0, 90.0])
+        )
+
+        if not self._phase_entered:
+            self._phase_entered = True
+            self._direct_grab_phase = 0
+            self._direct_grab_t0 = time.monotonic()
+            self.car.stop()
+            # Lower/extend onto the bumped bear with the gripper OPEN (no high raise).
+            self.arm.open_gripper()
+            self.arm.set_angles_deg(*grab_pose)
+            self.get_logger().info(
+                f"[{label}] direct grab: arm→{grab_pose} gripper open "
+                "(bear bumped, no IK)"
+            )
+            return False
+
+        elapsed = time.monotonic() - self._direct_grab_t0
+
+        if self._direct_grab_phase == 0:       # let the arm reach the grab pose
+            if elapsed < b.get("grab_direct_reach_s", 1.5):
+                return False
+            self.arm.close_gripper()
+            self.get_logger().info(f"[{label}] direct grab: close gripper")
+            self._direct_grab_phase = 1
+            self._direct_grab_t0 = time.monotonic()
+            return False
+
+        if self._direct_grab_phase == 1:       # let the gripper close on the bear
+            if elapsed < b.get("grab_direct_close_s", 1.0):
+                return False
+            self.arm.set_angles_deg_closed(*lift_pose)
+            self.get_logger().info(
+                f"[{label}] direct grab: raise to {lift_pose} holding bear"
+            )
+            self._direct_grab_phase = 2
+            self._direct_grab_t0 = time.monotonic()
+            return False
+
+        # phase 2: let the lift complete, then report done.
+        if elapsed < b.get("grab_direct_lift_s", 1.0):
+            return False
+        self._auto_grab_t0 = time.monotonic() - b["grab_wait_seconds"]
+        return True
+
     def _auto_grab_precondition_step(self, label: str, group=None):
         b = self.cfg["bear"]
         settle_s = b.get("pre_arm_settle_s", 0.5)
@@ -1994,7 +2061,7 @@ class ScriptedFinalMission(Node):
                 self._phase_goto(1)
 
         elif self._phase == 1:     # pre-arm, target_point, auto-arm grab (async)
-            if self._auto_grab_precondition_step("CLEAR_BEAR", "blocking"):
+            if self._grab_step("CLEAR_BEAR", "blocking"):
                 elapsed_after_trigger = time.monotonic() - self._auto_grab_t0
             else:
                 return
@@ -2224,7 +2291,7 @@ class ScriptedFinalMission(Node):
             group, interrupted = self._grasp_ramp_target_group_or_interrupt()
             if interrupted:
                 return
-            if self._auto_grab_precondition_step("GRASP_RAMP_BEAR", group):
+            if self._grab_step("GRASP_RAMP_BEAR", group):
                 elapsed_after_trigger = time.monotonic() - self._auto_grab_t0
             else:
                 return

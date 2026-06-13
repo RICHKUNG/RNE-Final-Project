@@ -382,6 +382,19 @@ bear:
   # Direct /robot_arm degrees, calibrated from /robot_arm echo:
   # [0.0, 141.0, 90.0] = raised claw pose that avoids sweeping through the bear.
   safe_pre_arm_pose_deg: [0.0, 141.0, 90.0]
+  # 2026-06-14 (Mr.Kung): DIRECT close-gripper grab — now the PRIMARY grab (not a
+  # fallback), replacing the IK auto_grab. At close range the chassis bumps the bear
+  # so it is already at the gripper: don't raise the claw first ("舉高爪子再夾"), just
+  # lower onto the bumped bear (gripper open), close, then raise to the lift pose
+  # holding it. Calibrated [108,120,90] grabs a bottom-centre object at YOLO ~0.39 m.
+  # Set grab_direct_close=false to restore the IK auto_grab. Applies to BOTH the
+  # blocking-bear clear (CLEAR_BEAR) and the ramp-bear grasp (GRASP_RAMP_BEAR).
+  grab_direct_close: false     # 2026-06-14 (Mr.Kung): reverted to IK auto_grab; set true to re-enable direct grab
+  grab_direct_pose_deg: [108.0, 120.0, 90.0]   # lower onto the bumped bear, gripper open
+  grab_direct_lift_deg: [0.0, 141.0, 90.0]     # raise to the "same position" after closing
+  grab_direct_reach_s: 1.5     # wait for the arm to reach the grab pose before closing
+  grab_direct_close_s: 1.0     # wait for the gripper to close on the bear
+  grab_direct_lift_s: 1.0      # wait for the lift to complete
   # Auto grab wrist/second-axis offset applied inside pros_car's arm_controller_2D.
   # Positive tilts the claw more forward from the IK pose.
   grab_wrist_forward_offset_deg: 30.0
