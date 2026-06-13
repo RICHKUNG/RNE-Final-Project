@@ -161,7 +161,7 @@ door_press:
   # 2026-06-13 field tune: 0.76 m / 3.0 s and 0.90 m / 4.0 s were both too short,
   # so raise the sanity distance to 1.12 m total and let the timed arc run longer.
   # forward_during_press_m (0.12) + push_after_unlock_m (1.00) = 1.12 m total.
-  push_after_unlock_m: 0.9
+  push_after_unlock_m: 0.93
   push_speed: 120.0          # straight segments: pre-press forward, retry backup
   # Arc push toward front-right while the claw holds the knob down. Hinge is
   # on the RIGHT (facing the door), handle on the LEFT, so the handle sweeps
@@ -332,6 +332,9 @@ bear:
   # but 0.35 leaves less margin; 0.36 was the conservative closer target.
   # 2026-06-14 (Mr.Kung): stop a touch farther from the bear → 0.38 (~5 cm margin).
   grab_target_distance_m: 0.38
+  # 2026-06-14 (Mr.Kung): GRASP_RAMP_BEAR uses its own (closer) servo stop
+  # distance; all other grabs keep grab_target_distance_m above.
+  ramp_grab_target_distance_m: 0.35
   # grab_commit_forward_seconds: DEPRECATED — superseded by the gap-bounded
   # stop-and-look creep above (the old timed open-loop push drove the body through the bear).
   grab_commit_forward_speed: 220.0

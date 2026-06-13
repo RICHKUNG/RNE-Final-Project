@@ -1848,6 +1848,9 @@ class ScriptedFinalMission(Node):
         turn = self.cfg["control"]["turn_slow_speed"]
         align_th = b["align_threshold_px"]
         grab_target = b.get("grab_target_distance_m", b["grab_distance_m"])
+        # The ramp bear gets its own (closer) servo stop distance.
+        if self._state == S.GRASP_RAMP_BEAR:
+            grab_target = b.get("ramp_grab_target_distance_m", 0.35)
 
         if time.monotonic() - self._phase_t0 > b["servo_timeout_s"]:
             self._fail(f"bear servo timeout in {self._state.name}")
@@ -1941,6 +1944,7 @@ class ScriptedFinalMission(Node):
         was_recently_near = prev_valid and prev_d < b["grab_distance_m"]
         jumped_from_near = False
         d_for_step = d
+        ramp_pick_near = False
         if d is not None and math.isfinite(d) and d > 0.0:
             jump_reject_m = float(b.get("depth_jump_reject_m", 0.0))
             jumped_from_near = (
@@ -1950,7 +1954,17 @@ class ScriptedFinalMission(Node):
             )
             if jumped_from_near:
                 d_for_step = prev_d
-                if not self._bear_depth_jump_rejected:
+                if self._state == S.GRASP_RAMP_BEAR:
+                    # The ramp bear is stationary; a frame that suddenly reads
+                    # far after a near lock is a bad depth sample. Always trust
+                    # the previous near depth and let the grab proceed instead of
+                    # rejecting/re-settling, which limit-cycles forever.
+                    ramp_pick_near = True
+                    self.get_logger().warn(
+                        f"[{self._state.name}] depth jump {prev_d:.2f}→{d:.2f}m; "
+                        f"always using near depth {prev_d:.2f}m"
+                    )
+                elif not self._bear_depth_jump_rejected:
                     self._bear_depth_jump_rejected = True
                     self.get_logger().warn(
                         f"[{self._state.name}] depth jump {prev_d:.2f}→{d:.2f}m "
@@ -1958,15 +1972,19 @@ class ScriptedFinalMission(Node):
                     )
                     self._servo_enter_burst("SETTLE", 0.0, 0.0)
                     return False
-                self.get_logger().warn(
-                    f"[{self._state.name}] repeated depth jump {prev_d:.2f}→{d:.2f}m; "
-                    f"using previous near depth {prev_d:.2f}m for creep sizing"
-                )
+                else:
+                    self.get_logger().warn(
+                        f"[{self._state.name}] repeated depth jump {prev_d:.2f}→{d:.2f}m; "
+                        f"using previous near depth {prev_d:.2f}m for creep sizing"
+                    )
             else:
                 self._bear_depth_jump_rejected = False
                 self._bear_last_settle_depth = d
-        at_depth = d is not None and 0 < d <= grab_target
-        band = self._bear_grab_align_band_px(d) if at_depth else align_th
+        # On the ramp, drive the grab/align gate off the trusted near depth, not
+        # the rejected far reading, so at_depth can actually open.
+        d_eff = d_for_step if ramp_pick_near else d
+        at_depth = d_eff is not None and 0 < d_eff <= grab_target
+        band = self._bear_grab_align_band_px(d_eff) if at_depth else align_th
 
         # 1) Outside the band → one rotate burst toward the bear, sized by |dx|.
         if abs(dx) > band:
@@ -1983,10 +2001,10 @@ class ScriptedFinalMission(Node):
 
         # 2) Within band + at grab depth → done.
         if at_depth:
-            snap = self._cache_bear_grab_snapshot(group, d, dx)
+            snap = self._cache_bear_grab_snapshot(group, d_eff, dx)
             snap_source = snap["source"] if snap is not None else "none"
             self.get_logger().info(
-                f"[{self._state.name}] settled aligned dx={dx:.0f}px d={d:.2f}m "
+                f"[{self._state.name}] settled aligned dx={dx:.0f}px d={d_eff:.2f}m "
                 f"band={band:.0f}px marker={snap_source} → stop & grab"
             )
             self._bear_commit_t0 = None
