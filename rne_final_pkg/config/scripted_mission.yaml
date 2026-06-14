@@ -23,16 +23,16 @@ route:
   start_heading_yaw: 0.0486   # rad — heading at spawn (reference for calibration)
 
   turn_point:          # measured: end of the first straight leg from spawn
-    x: 3.0378860404780157
+    x: 3.2
     y: 0.025078211891774258
     yaw: 0.0486        # rad — heading on arrival; left-turn target = yaw + pi/2
     tolerance: 0.20
   door_lane_point:     # PROVISIONAL calibration value, not measured:
-    x: 3.0378860404780157   #   x = turn_point.x
+    x: 3.2  #   x = turn_point.x
     y: 1.6131596549874418   #   y = door_front.y
     tolerance: 0.20         # replace with the measured second-turn pose when available
   door_front:          # measured: standing point facing the door knob
-    x: 3.058493898788231
+    x: 3.2
     y: 1.6131596549874418
     yaw: 0.0341        # rad — final heading facing the knob (right-turn target)
     tolerance: 0.15
@@ -48,15 +48,15 @@ route:
   # to the short chain; exhausting both fails. yaw is radians (from the measured
   # quaternion; yaw_deg kept in the comment for reference).
   long_side_observe:   # car faces ≈ -x, scanning the ramp from the long side
-    - x: 3
+    - x: 3.2
       y: 2.4
       yaw: -3.14    # yaw_deg -173.50
       tolerance: 0.25
-    - x: 3
+    - x: 3.2
       y: 1.5
       yaw: -3.14     # yaw_deg -178.91
       tolerance: 0.25
-    - x: 3
+    - x: 3.2
       y: 0.9
       yaw: -3.14     # yaw_deg -178.75
       tolerance: 0.25
@@ -69,7 +69,7 @@ route:
       y: 0
       yaw: 1.57     # yaw_deg 96.66
       tolerance: 0.25
-    - x: 0.85
+    - x: 0.75
       y: 0
       yaw: 1.57      # yaw_deg 98.17
       tolerance: 0.25
@@ -161,7 +161,7 @@ door_press:
   # 2026-06-13 field tune: 0.76 m / 3.0 s and 0.90 m / 4.0 s were both too short,
   # so raise the sanity distance to 1.12 m total and let the timed arc run longer.
   # forward_during_press_m (0.12) + push_after_unlock_m (1.00) = 1.12 m total.
-  push_after_unlock_m: 0.93
+  push_after_unlock_m: 0.95
   push_speed: 120.0          # straight segments: pre-press forward, retry backup
   # Arc push toward front-right while the claw holds the knob down. Hinge is
   # on the RIGHT (facing the door), handle on the LEFT, so the handle sweeps
@@ -203,12 +203,16 @@ door_press:
 
 post_task3:
   # After the door opens, turn back to face forward (TASK3_TURN_FORWARD), then
-  # reverse straight back this far (pose-measured) before scanning for the ramp —
-  # clears the doorway so the ramp comes into the camera's view for the
-  # observe/scan chain.
+  # reverse straight (map -x) until the pose x drops to backup_target_x before
+  # scanning for the ramp — clears the doorway so the ramp comes into the
+  # camera's view for the observe/scan chain.
   turn_forward_timeout_s: 5.0  # give up the face-forward turn after this (still
                                # jammed on the door) and reverse anyway
-  backup_distance_m: 0.7
+  # 2026-06-14 (Mr.Kung): reverse to an ABSOLUTE map x (was backup_distance_m: 0.7,
+  # a relative pose distance). Car faces +x after TURN_FORWARD, so reversing lowers
+  # x toward this target. door_exit sits at x≈3.56; 3.2 pulls it back off the doorway.
+  backup_target_x: 3.2
+  backup_max_travel_m: 1.0   # pose-measured runaway guard (NOT a timer) if mis-yawed
   backup_speed: 400.0        # slow_speed; in-place reverse, no heading control
 
 ramp:
@@ -421,18 +425,23 @@ bear:
   # fallback), replacing the IK auto_grab. At close range the chassis bumps the bear
   # so it is already at the gripper: don't raise the claw first ("舉高爪子再夾"), just
   # lower onto the bumped bear (gripper open), close, then raise to the lift pose
-  # holding it. Calibrated [108,120,90] grabs a bottom-centre object at YOLO ~0.39 m.
+  # holding it. Calibrated [108,132,90] grabs a bottom-centre object at YOLO ~0.39 m.
   # Set grab_direct_close=false to restore the IK auto_grab. Applies to BOTH the
   # blocking-bear clear (CLEAR_BEAR) and the ramp-bear grasp (GRASP_RAMP_BEAR).
-  grab_direct_close: false     # 2026-06-14 (Mr.Kung): reverted to IK auto_grab; set true to re-enable direct grab
-  grab_direct_pose_deg: [108.0, 120.0, 90.0]   # lower onto the bumped bear, gripper open
-  grab_direct_lift_deg: [0.0, 141.0, 90.0]     # raise to the "same position" after closing
+  # 2026-06-14 (Mr.Kung): re-enabled the direct fixed-angle grab so the 3-axis grab
+  # joint angles below are tunable from THIS YAML (IK computed them at runtime and
+  # left nothing to hand-adjust). Set false to restore the IK auto_grab.
+  grab_direct_close: true      # 2026-06-14 (Mr.Kung): direct fixed-angle grab ON
+  # === 夾熊三軸關節角度 [joint0, joint1, joint2] (度) — 直接在這裡調整 ===
+  # safe_pre_arm_pose_deg above = 伸手前的安全高位。下面兩組是夾取本身：
+  grab_direct_pose_deg: [108.0, 132.0, 90.0]   # 下壓到撞到的熊上、夾爪張開 (lower onto bumped bear, gripper open)
+  grab_direct_lift_deg: [0.0, 141.0, 90.0]     # 夾住後抬起 (raise holding the bear after closing)
   grab_direct_reach_s: 1.5     # wait for the arm to reach the grab pose before closing
   grab_direct_close_s: 1.0     # wait for the gripper to close on the bear
   grab_direct_lift_s: 1.0      # wait for the lift to complete
   # Auto grab wrist/second-axis offset applied inside pros_car's arm_controller_2D.
   # Positive tilts the claw more forward from the IK pose.
-  grab_wrist_forward_offset_deg: 40.0
+  grab_wrist_forward_offset_deg: 30.0   # 2026-06-14 (Mr.Kung): reverted 40->30 (original); 40 left the claw too high. arm_controller_2D default is also 30.
   # Close-range bbox/marker can disappear while the arm raises; hold the grab-pose
   # target snapshot briefly so CLEAR_BEAR does not oscillate forward/backward.
   grab_snapshot_max_age_s: 2.0
@@ -512,9 +521,53 @@ return:
   #   vertical   (yaw near +90°)  → reverse straight to the saved short-side observe point
   bridge_yaw_select_threshold_deg: 55.0
   bridge_exit_speed: 300.0
+  # 2026-06-14 (Mr.Kung): RETURN now ALIGNS before leaving the bridge (phase 0):
+  #   1. turn to the standard yaw below for this orientation, then
+  #   2. drive along that heading so the along-axis coordinate matches the recorded
+  #      charge-up point (上衝點): horizontal exit aligns X, vertical exit aligns Y.
+  # Then phase 5 runs the actual exit (horizontal forward / vertical reverse).
+  # Standard yaw (rad): horizontal (faces ±x, 橫橋→align X) ≈ -180°,
+  # vertical (faces ±y, 直橋→align Y) ≈ +90° — matches long_/short_side_observe.
+  bridge_exit_realign_horizontal_yaw: -3.14
+  bridge_exit_realign_vertical_yaw: 1.57
+  bridge_exit_align_tol_m: 0.10        # along-axis match tolerance to the charge point
+  bridge_exit_align_speed: 300.0       # drive speed for the charge-axis alignment leg
+  bridge_exit_align_timeout_s: 8.0     # cap on the whole align (yaw+coord); then exit anyway
+  # Stuck watchdog during the phase 5 exit drive: if the car moves less than
+  # stuck.move_threshold_m for this long it is wedged → go back to phase 0 to
+  # re-align (yaw + charge axis) and re-judge the bridge rule. NOTE: a truly
+  # wedged car can loop (align → exit → stuck → align …); raise the timeout or
+  # add a give-up cap if needed.
+  bridge_exit_stuck_timeout_s: 4.0
   horizontal_forward_m: 1.0
   vertical_reverse_m: 1.5     # fallback only if no saved observe point exists
   observe_reverse_max_extra_m: 0.3
   drop_at_origin: true       # false = hold the bear at origin until task trigger
   drop_wait_seconds: 2.0
   back_away_seconds: 1.0
+
+patrol:
+  # Post-mission cleanup pass (Mr.Kung 2026-06-14): "任務做完回到原點之後再走一次到
+  # turn point 的路，路上看到熊且不在 ramp mask 之上(比較 y 值)的話就抓回原點."
+  # After RETURN_ORIGIN delivers the ramp bear, drive ONCE MORE from origin toward
+  # route.turn_point. If a bear that is NOT on the ramp appears, grab it and carry
+  # it back to route.origin, then the mission finishes (single bear — no repeat
+  # sweep). false = finish at DONE as before (no extra pass).
+  # NOTE: assumes return.drop_at_origin=true so the ramp bear is already dropped
+  # before the patrol starts (otherwise the car would patrol while still holding it).
+  enabled: true
+  # "Not on the ramp" reuses the YOLO publisher's existing on-ramp classification
+  # (/yolo/bear_info on_ramp flag: 1.0 on ramp, 0.0 ground/blocking, -1.0 = no ramp
+  # mask in view). A bear qualifies when on_ramp < 0.5, the read is fresh, and it is
+  # within max_bear_distance_m. The servo/grab + drop reuse the bear.* / return.* /
+  # control.* settings already tuned above.
+  bear_info_stale_s: 0.5
+  # Forward-depth gate (m) so the patrol doesn't lunge at a far/noisy detection;
+  # turn_point sits ~3.2 m from origin. Raise (e.g. 99) to disable.
+  max_bear_distance_m: 2.5
+  # Ignore bears until the car is at least this far from origin, so the bear just
+  # dropped at origin (and clutter right at the drop point) is not re-grabbed.
+  min_grab_from_origin_m: 0.8
+  # The main mission already succeeded, so if the bear is lost for this long during
+  # the grab servo, abandon the grab and finish instead of failing the mission.
+  grab_lost_timeout_s: 6.0

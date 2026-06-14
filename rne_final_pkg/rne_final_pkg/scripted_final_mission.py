@@ -77,6 +77,14 @@ class S(Enum):
     GRASP_RAMP_BEAR = auto()
     RETURN_ORIGIN = auto()
 
+    # Post-mission cleanup patrol (Mr.Kung 2026-06-14): after RETURN_ORIGIN
+    # delivers the ramp bear, drive once more toward turn_point; a bear NOT on
+    # the ramp gets grabbed and carried back to origin, then DONE. Gated by
+    # cfg["patrol"]["enabled"]; see _state_patrol_*.
+    PATROL_TO_TURN = auto()
+    PATROL_GRAB = auto()
+    PATROL_RETURN = auto()
+
     DONE = auto()
     FAILED = auto()
 
@@ -171,6 +179,8 @@ class ScriptedFinalMission(Node):
                                      # Persists across _goto (not reset there).
         self._approach_done = False  # ramp approach reached approach_done_area at least once
         self._charge_anchor = None   # RAMP_APPROACH charge-mode start xy (pose-measured distance)
+        self._ramp_charge_point = None  # 上衝點: ramp-foot xy where the charge began;
+                                        # recorded once, persists across _goto for RETURN alignment
         self._ramp_grasp_backup_done = False    # one-time GRASP_RAMP_BEAR entry backup fired
         self._ramp_grasp_backup_anchor = None   # entry-backup reverse start xy (pose-measured)
         self._ramp_grasp_backup_t0 = None       # entry-backup decision/reverse timer
@@ -208,6 +218,7 @@ class ScriptedFinalMission(Node):
         self._return_reverse_wp = None
         self._return_reverse_start_dist = None
         self._return_reverse_wp_label = None
+        self._return_exit_stuck_anchor = None  # (x, y, monotonic) watchdog for bridge-exit progress
         self._press_attempts = 0
         self._knob_invalid_t0 = None
         self._servo_settle_t0 = None     # knob servo: in-window settle timer
@@ -219,6 +230,9 @@ class ScriptedFinalMission(Node):
 
         # sea guard: True while actively escaping the +x sea edge (see _sea_guard)
         self._sea_escaping = False
+
+        # post-mission patrol: lost-bear abandon timer (see _state_patrol_grab)
+        self._patrol_grab_lost_t0 = None
 
         self.create_timer(0.1, self._tick)   # 10 Hz control loop
         self.get_logger().info(f"{self.get_name()} ready — waiting for pose + YOLO topics (INIT)")
@@ -356,6 +370,7 @@ class ScriptedFinalMission(Node):
         self._return_reverse_wp = None
         self._return_reverse_start_dist = None
         self._return_reverse_wp_label = None
+        self._return_exit_stuck_anchor = None
         self._charge_anchor = None
         # Re-arm the one-time GRASP_RAMP_BEAR entry backup on every fresh state
         # entry (i.e. a fresh charge→grasp). Retries use _phase_goto, not _goto,
@@ -428,9 +443,10 @@ class ScriptedFinalMission(Node):
                 else S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE
             )
             self._state_back_up(
-                self.cfg["post_task3"]["backup_distance_m"],
+                self.cfg["post_task3"]["backup_target_x"],
                 self.cfg["post_task3"]["backup_speed"],
                 after_backup,
+                self.cfg["post_task3"].get("backup_max_travel_m"),
             )
         elif s == S.MOVE_TO_RAMP_OBSERVE_LONG_SIDE:
             self._state_move_observe(self.cfg["route"]["long_side_observe"], S.RAMP_SCAN_LONG_SIDE)
@@ -468,7 +484,21 @@ class ScriptedFinalMission(Node):
         elif s == S.GRASP_RAMP_BEAR:
             self._state_grasp_ramp_bear(S.RETURN_ORIGIN)
         elif s == S.RETURN_ORIGIN:
-            self._state_return_origin(S.DONE)
+            # After delivering the ramp bear, optionally run the post-mission
+            # cleanup patrol (drive once more to turn_point and grab a ground
+            # bear that is not on the ramp). Disabled → finish as before.
+            after_return = (
+                S.PATROL_TO_TURN
+                if (self.cfg.get("patrol") or {}).get("enabled", False)
+                else S.DONE
+            )
+            self._state_return_origin(after_return)
+        elif s == S.PATROL_TO_TURN:
+            self._state_patrol_to_turn(S.PATROL_GRAB, S.DONE)
+        elif s == S.PATROL_GRAB:
+            self._state_patrol_grab(S.PATROL_RETURN, S.DONE)
+        elif s == S.PATROL_RETURN:
+            self._state_patrol_return(S.DONE)
         elif s == S.DONE:
             self.car.stop()
             if not self._done_logged:
@@ -1036,31 +1066,39 @@ class ScriptedFinalMission(Node):
         if elapsed > c["arm_settle_s"]:
             self._goto(next_state)
 
-    def _state_back_up(self, distance_m, speed, next_state):
-        """Reverse straight back `distance_m` (pose-measured) before continuing.
-        Run after the door opens to clear the doorway so the ramp comes into
-        view for the observe/scan chain."""
+    def _state_back_up(self, target_x, speed, next_state, max_travel_m=None):
+        """Reverse straight until the map-frame x drops to `target_x` (absolute,
+        pose-measured) before continuing. Run after the door opens to clear the
+        doorway so the ramp comes into view for the observe/scan chain. The car
+        faces +x here (TURN_FORWARD), so reversing lowers x toward target_x.
+        `max_travel_m` is a pose-measured runaway guard (not a timer) for a
+        mis-yawed car that would otherwise reverse without ever reaching x."""
         if not self._require_pose():
             return
         px, py, _ = self.pose
         if self._anchor is None:
             self._anchor = (px, py)
             self.get_logger().info(
-                f"[BACK_UP_AFTER_TASK3] backing up {distance_m:.1f}m before ramp search"
+                f"[BACK_UP_AFTER_TASK3] reversing to x={target_x:.2f} (from x={px:.2f})"
             )
         ax, ay = self._anchor
         travelled = math.hypot(px - ax, py - ay)
-        if travelled >= distance_m:
+        reached = px <= target_x
+        capped = max_travel_m is not None and travelled >= max_travel_m
+        if reached or capped:
             self.car.stop()
             self.arm.stow()
+            why = "reached x target" if reached else f"travel cap {max_travel_m:.1f}m"
             self.get_logger().info(
-                f"[BACK_UP_AFTER_TASK3] backed up {travelled:.2f}m → {next_state.name}"
+                f"[BACK_UP_AFTER_TASK3] {why}: x={px:.2f} "
+                f"(travelled {travelled:.2f}m) → {next_state.name}"
             )
             self._goto(next_state)
             return
         self.car.publish_velocities(-speed, -speed)
         self.get_logger().info(
-            f"[BACK_UP_AFTER_TASK3] backed up {travelled:.2f}/{distance_m:.1f}m"
+            f"[BACK_UP_AFTER_TASK3] reversing: x={px:.2f} → {target_x:.2f} "
+            f"(travelled {travelled:.2f}m)"
         )
 
     # ------------------------------------------------------------------
@@ -1375,8 +1413,12 @@ class ScriptedFinalMission(Node):
         px, py, _ = self.pose
         if self._charge_anchor is None:
             self._charge_anchor = (px, py)
+            # 上衝點: persist the ramp foot so RETURN can re-square to it (X for
+            # horizontal exits, Y for vertical) before leaving the bridge.
+            self._ramp_charge_point = (px, py)
             self.get_logger().info(
-                f"[RAMP_CHARGE] commit → unconditional charge {dist_target:.2f}m @{speed:.0f}"
+                f"[RAMP_CHARGE] commit → unconditional charge {dist_target:.2f}m @{speed:.0f} "
+                f"(charge point {px:.2f},{py:.2f} saved for RETURN)"
             )
         ax, ay = self._charge_anchor
         travelled = math.hypot(px - ax, py - ay)
@@ -2736,35 +2778,90 @@ class ScriptedFinalMission(Node):
         )
         return False
 
+    def _align_axis_to_charge(self, mode) -> bool:
+        """Drive forward/back along the (already-confirmed) standard heading so the
+        along-exit-axis coordinate matches the recorded charge-up point (上衝點):
+        horizontal mode (faces ±x) aligns X, vertical mode (faces ±y) aligns Y.
+        Returns True when within tolerance (and stops)."""
+        r = self.cfg["return"]
+        px, py, yaw = self.pose
+        cx, cy = self._ramp_charge_point
+        tol = r.get("bridge_exit_align_tol_m", 0.10)
+        speed = r.get("bridge_exit_align_speed", r["bridge_exit_speed"])
+        if mode == "horizontal":
+            target_c, cur_c, fwd, axis = cx, px, math.cos(yaw), "x"
+        else:
+            target_c, cur_c, fwd, axis = cy, py, math.sin(yaw), "y"
+        err = target_c - cur_c
+        if abs(err) <= tol:
+            self.car.stop()
+            return True
+        # Drive forward when forward motion (sign = fwd) reduces |err|, else reverse.
+        v = abs(speed) if (err * fwd) > 0 else -abs(speed)
+        self.car.publish_velocities(v, v)
+        self.get_logger().info(
+            f"[RETURN] charge-align {axis}: cur={cur_c:.2f} target={target_c:.2f} "
+            f"err={err:.2f}m → {'FWD' if v > 0 else 'REV'}"
+        )
+        return False
+
     def _state_return_origin(self, next_state):
         r = self.cfg["return"]
         elapsed = time.monotonic() - self._phase_t0
 
-        if self._phase == 0:       # leave the bridge by yaw, then route home
+        if self._phase == 0:       # ALIGN: standard yaw + along-axis coord to charge point
             if not self._require_pose():
                 return
-            if self._anchor is None:
-                # Exit direction comes PURELY from yaw — never from XY map coords.
-                # Absolute XY drifts / gets mis-calibrated and wrongly reads
-                # "off-bridge", which sent the car into an in-place rotate on the
-                # ramp. RETURN always follows a ramp grab, so always back off the
-                # structure first. _anchor below is only a relative odometry start
-                # point for the reverse distance, not an absolute on-bridge test.
-                self._anchor = self.pose[:2]
+            if self._return_exit_mode is None:
+                # Exit direction comes PURELY from yaw — never from XY map coords
+                # (absolute XY drifts and wrongly reads "off-bridge", which once
+                # sent the car into an in-place rotate on the ramp). RETURN always
+                # follows a ramp grab, so always re-square to the canonical heading.
                 self._return_exit_mode = self._select_return_exit_mode()
-                x, y, yaw = self.pose
+                _, _, yaw0 = self.pose
                 self.get_logger().info(
-                    f"[RETURN] bridge exit mode={self._return_exit_mode} "
-                    f"yaw={math.degrees(yaw):.0f}° (yaw-based; XY ignored)"
+                    f"[RETURN] align: exit mode={self._return_exit_mode} "
+                    f"yaw={math.degrees(yaw0):.0f}° (yaw-based; XY ignored)"
                 )
+
+            # Standard yaw for this orientation: horizontal (faces ±x) ≈ -180°,
+            # vertical (faces ±y) ≈ +90°.
+            if self._return_exit_mode == "horizontal":
+                target_yaw = r.get("bridge_exit_realign_horizontal_yaw", -3.14)
+            else:
+                target_yaw = r.get("bridge_exit_realign_vertical_yaw", 1.57)
+            align_timed_out = elapsed > r.get("bridge_exit_align_timeout_s", 8.0)
+
+            # Step 1 — confirm YAW.
+            if not align_timed_out and not self._turn_to_yaw(target_yaw):
+                return
+            # Step 2 — bring the along-exit-axis coordinate in line with the
+            # recorded charge-up point (上衝點): horizontal aligns X, vertical
+            # aligns Y. Skipped if no charge point was ever recorded.
+            if (not align_timed_out and self._ramp_charge_point is not None
+                    and not self._align_axis_to_charge(self._return_exit_mode)):
+                return
+
+            self.car.stop()
+            self.get_logger().info(
+                f"[RETURN] aligned ({'timeout' if align_timed_out else 'ok'}) → bridge exit"
+            )
+            self._phase_goto(5)
+            return
+
+        elif self._phase == 5:     # EXIT: leave the bridge along the standard heading
+            if not self._require_pose():
+                return
+            if not self._phase_entered:
+                self._phase_entered = True
                 if self._return_exit_mode == "vertical":
+                    x, y, _ = self.pose
                     wp, label = self._return_observe_waypoint()
                     self._return_reverse_wp = wp
                     self._return_reverse_wp_label = label
                     if wp is not None:
                         self._return_reverse_start_dist = math.hypot(
-                            wp["x"] - x,
-                            wp["y"] - y,
+                            wp["x"] - x, wp["y"] - y
                         )
                         self.get_logger().info(
                             f"[RETURN] reverse exit target={label} "
@@ -2776,6 +2873,32 @@ class ScriptedFinalMission(Node):
                             "[RETURN] reverse exit has no saved observe point; "
                             "falling back to configured reverse distance"
                         )
+
+            # Watchdog: no progress → re-align (yaw + charge axis) and re-judge in
+            # phase 0, rather than abandoning the bridge rule.
+            now = time.monotonic()
+            sx, sy, _ = self.pose
+            move_thr = self.cfg["stuck"]["move_threshold_m"]
+            stuck_to = r.get("bridge_exit_stuck_timeout_s", 4.0)
+            if self._return_exit_stuck_anchor is None:
+                self._return_exit_stuck_anchor = (sx, sy, now)
+            else:
+                ax, ay, at = self._return_exit_stuck_anchor
+                if math.hypot(sx - ax, sy - ay) > move_thr:
+                    self._return_exit_stuck_anchor = (sx, sy, now)
+                elif now - at > stuck_to:
+                    self.car.stop()
+                    self.get_logger().warn(
+                        f"[RETURN] bridge exit STUCK — no movement for {now - at:.1f}s; "
+                        f"re-aligning ({self._return_exit_mode}) then re-judging bridge rule"
+                    )
+                    self._return_exit_stuck_anchor = None
+                    self._return_exit_mode = None   # re-judge mode + re-align in phase 0
+                    self._return_reverse_wp = None
+                    self._return_reverse_start_dist = None
+                    self._return_reverse_wp_label = None
+                    self._phase_goto(0)
+                    return
 
             if self._return_exit_mode == "horizontal":
                 target = r.get("horizontal_forward_m", 1.0)
@@ -2837,6 +2960,133 @@ class ScriptedFinalMission(Node):
                 self.car.stop()
                 self.arm.stow()   # done with the arm — fold it away
                 self._goto(next_state)
+
+    # ------------------------------------------------------------------
+    # Post-mission cleanup patrol — drive once more toward turn_point and grab
+    # a ground bear (NOT on the ramp), then deliver it to origin and finish.
+    # Mr.Kung 2026-06-14: "任務做完回到原點之後再走一次到 turn point 的路，路上看到熊
+    # 且不在 ramp mask 之上(比較 y 值)的話就抓回原點." Single bear, no repeat sweep.
+    # ------------------------------------------------------------------
+
+    def _patrol_bear_qualifies(self):
+        """True when a patrol-grabbable bear is in view: visible, fresh, and NOT
+        on the ramp. 'Not on the ramp' reuses the publisher's existing on-ramp
+        classification (bbox centre-y vs ramp centre-y) exposed as bear_on_ramp():
+        1.0 = on the ramp → skip; 0.0 (ground/blocking) or -1.0 (no ramp mask in
+        view) → qualifies. An optional depth gate avoids chasing a far/noisy hit."""
+        p = self.cfg.get("patrol") or {}
+        if not self.yolo.bear_visible():
+            return False
+        age = self.yolo.bear_age_s()
+        if age is None or age > p.get("bear_info_stale_s", 0.5):
+            return False
+        if self.yolo.bear_on_ramp() >= 0.5:        # on the ramp → not a ground bear
+            return False
+        d = self.yolo.bear_distance()
+        max_d = p.get("max_bear_distance_m", 2.5)
+        if d is not None and math.isfinite(d) and d > 0.0 and d > max_d:
+            return False
+        return True
+
+    def _state_patrol_to_turn(self, grab_state, done_state):
+        """Drive once more from origin toward route.turn_point, watching for a
+        ground bear the whole way. A qualifying bear interrupts the drive to grab
+        it; reaching turn_point with nothing to grab finishes the mission. Bears
+        are ignored until the car is min_grab_from_origin_m away so the just-
+        delivered bear sitting at origin is not immediately re-grabbed."""
+        p = self.cfg.get("patrol") or {}
+        if not self._require_pose():
+            return
+        px, py, _ = self.pose
+        o = self.cfg["route"]["origin"]
+        from_origin = math.hypot(px - o["x"], py - o["y"])
+        if (
+            from_origin >= p.get("min_grab_from_origin_m", 0.8)
+            and self._patrol_bear_qualifies()
+        ):
+            self.car.stop()
+            self.get_logger().info(
+                f"[PATROL] ground bear (not on ramp) d={self.yolo.bear_distance():.2f}m "
+                f"dx={self.yolo.bear_delta_x():.0f}px on_ramp={self.yolo.bear_on_ramp():.0f} "
+                f"(from_origin={from_origin:.2f}m) → grab"
+            )
+            self._goto(grab_state)
+            return
+        if self._drive_to_point(self.cfg["route"]["turn_point"]):
+            self.car.stop()
+            self.get_logger().info(
+                "[PATROL] reached turn_point with no ground bear → mission complete"
+            )
+            self._goto(done_state)
+
+    def _state_patrol_grab(self, return_state, abandon_state):
+        """Servo to the overall-nearest bear and grab it, reusing the bear servo
+        + grab primitives. The main mission already succeeded, so a bear lost for
+        too long abandons the grab (→ done) instead of failing the mission."""
+        p = self.cfg.get("patrol") or {}
+        b = self.cfg["bear"]
+
+        if self._phase == 0:       # servo to the bear
+            now = time.monotonic()
+            if self.yolo.bear_visible() and self.yolo.bear_age_s() is not None:
+                self._patrol_grab_lost_t0 = None
+            else:
+                if self._patrol_grab_lost_t0 is None:
+                    self._patrol_grab_lost_t0 = now
+                elif now - self._patrol_grab_lost_t0 > p.get("grab_lost_timeout_s", 6.0):
+                    self.car.stop()
+                    self.get_logger().warn(
+                        "[PATROL] bear lost during grab servo → abandon "
+                        "(main mission already complete)"
+                    )
+                    self._goto(abandon_state)
+                    return
+            if self._bear_servo_step(None):
+                self._patrol_grab_lost_t0 = None
+                self._phase_goto(1)
+
+        elif self._phase == 1:     # pre-arm, target_point, auto-arm grab (async)
+            if self._grab_step("PATROL_GRAB", None):
+                elapsed_after_trigger = time.monotonic() - self._auto_grab_t0
+            else:
+                return
+            if elapsed_after_trigger > b["grab_wait_seconds"]:
+                self.car.stop()
+                self.get_logger().info("[PATROL] bear grabbed → return to origin")
+                self._goto(return_state)
+
+    def _state_patrol_return(self, done_state):
+        """Drive straight back to origin (no bridge-exit logic — the patrol stays
+        on flat ground), drop the bear, back away, stow, and finish."""
+        r = self.cfg["return"]
+        elapsed = time.monotonic() - self._phase_t0
+
+        if self._phase == 0:       # route straight to origin
+            if not self._require_pose():
+                return
+            if self._drive_to_point(self.cfg["route"]["origin"]):
+                self._phase_goto(1)
+
+        elif self._phase == 1:     # drop the bear at origin
+            if not self._phase_entered:
+                self._phase_entered = True
+                self.get_logger().info("[PATROL] dropping bear at origin")
+                self.arm.open_gripper()
+            self.car.stop()
+            if elapsed > r.get("drop_wait_seconds", 2.0):
+                self._phase_goto(2)
+
+        elif self._phase == 2:     # back away and stow
+            self.car.publish_velocities(
+                -self.cfg["control"]["slow_speed"], -self.cfg["control"]["slow_speed"]
+            )
+            if elapsed > r.get("back_away_seconds", 1.0):
+                self.car.stop()
+                self.arm.stow()
+                self.get_logger().info(
+                    "[PATROL] bear delivered to origin → mission complete"
+                )
+                self._goto(done_state)
 
 
 def main(args=None):
