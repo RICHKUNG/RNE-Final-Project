@@ -61,7 +61,7 @@ route:
       yaw: -3.14     # yaw_deg -178.75
       tolerance: 0.25
   short_side_observe:  # car faces ≈ +y, scanning the ramp from the short side
-    - x: 2.1
+    - x: 1.9
       y: 0
       yaw: 1.57      # yaw_deg 89.21
       tolerance: 0.25
@@ -272,7 +272,11 @@ ramp:
   # until the ramp area is reached / a close bear appears / the distance is done.
   # Knocking a bear over while charging is acceptable.
   charge_mode: true
-  charge_distance_m: 1.75          # blind forward commit distance from ramp foot to bear
+  charge_distance_m: 1.1         # blind forward commit distance from ramp foot to bear
+  # 2026-06-14 (Mr.Kung): charge is now unconditional from the ramp foot — only this
+  # pose-measured distance ends it. The area≥approach_done_area and close-bear early
+  # exits were removed (both fired at travelled≈0 and made the car back up instead of
+  # climbing). approach_done_area is still used by the stop-and-look (non-charge) path.
   charge_speed: 400.0              # strong enough to climb without stalling on the ramp
   charge_center_threshold_px: 90.0  # only a large dx interrupts the charge for a quick re-center
 
@@ -350,6 +354,18 @@ bear:
   # 2026-06-14 (Mr.Kung): GRASP_RAMP_BEAR uses its own (closer) servo stop
   # distance; all other grabs keep grab_target_distance_m above.
   ramp_grab_target_distance_m: 0.38
+  # 2026-06-14 (Mr.Kung): one-time entry backup for GRASP_RAMP_BEAR. The charge can
+  # leave the car looking at the ramp bear from too far; if the first settled bear
+  # depth (/yolo/bear_info) exceeds ramp_grasp_backup_trigger_m, reverse a short
+  # pose-measured distance once before the careful servo starts. One-shot per state
+  # entry (re-armed only on a fresh charge→grasp), so a noisy far depth read mid-
+  # grasp cannot trigger repeated reversing. Set trigger high (e.g. 99) to disable.
+  ramp_grasp_backup_trigger_m: 1.0
+  ramp_grasp_backup_distance_m: 0.30
+  ramp_grasp_backup_speed: 350.0     # reverse speed (≈ control.slow_speed)
+  ramp_grasp_backup_settle_s: 0.4    # stop & let the camera/YOLO catch up before the first depth read
+  ramp_grasp_backup_decide_s: 1.5    # no fresh bear read within this → skip the backup
+  ramp_grasp_backup_timeout_s: 2.0   # watchdog cap on the reverse leg
   # grab_commit_forward_seconds: DEPRECATED — superseded by the gap-bounded
   # stop-and-look creep above (the old timed open-loop push drove the body through the bear).
   grab_commit_forward_speed: 220.0
@@ -433,7 +449,7 @@ bear:
   # 2026-06-13 (Mr.Kung): temporarily skip the probe/depth verify after grabbing
   # the ramp bear — once the grab wait completes, return straight to origin.
   # Set false to restore the full verify chain (probe + depth-stability check).
-  skip_grasp_verify: false
+  skip_grasp_verify: True
   verify_retry_on_ground: true
   # 2026-06-14 (Mr.Kung): cancelled the retry cap. <0 = unlimited verify
   # retries — a failed verify no longer fails the mission ("grab failed after

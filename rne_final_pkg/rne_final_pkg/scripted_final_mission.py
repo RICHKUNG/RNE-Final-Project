@@ -171,6 +171,9 @@ class ScriptedFinalMission(Node):
                                      # Persists across _goto (not reset there).
         self._approach_done = False  # ramp approach reached approach_done_area at least once
         self._charge_anchor = None   # RAMP_APPROACH charge-mode start xy (pose-measured distance)
+        self._ramp_grasp_backup_done = False    # one-time GRASP_RAMP_BEAR entry backup fired
+        self._ramp_grasp_backup_anchor = None   # entry-backup reverse start xy (pose-measured)
+        self._ramp_grasp_backup_t0 = None       # entry-backup decision/reverse timer
         self._ramp_aligned = False   # RAMP_ALIGN_BOTTOM cleared its launch gate at least once;
                                      # gates triage classify (pre-align) vs grasp classify (post-align).
                                      # Persists across _goto (not reset there).
@@ -354,6 +357,12 @@ class ScriptedFinalMission(Node):
         self._return_reverse_start_dist = None
         self._return_reverse_wp_label = None
         self._charge_anchor = None
+        # Re-arm the one-time GRASP_RAMP_BEAR entry backup on every fresh state
+        # entry (i.e. a fresh charge→grasp). Retries use _phase_goto, not _goto,
+        # so they don't re-trigger it.
+        self._ramp_grasp_backup_done = False
+        self._ramp_grasp_backup_anchor = None
+        self._ramp_grasp_backup_t0 = None
 
     def _phase_goto(self, phase: int):
         self.get_logger().info(f"[{self._state.name}] phase {self._phase} -> {phase}")
@@ -1367,8 +1376,7 @@ class ScriptedFinalMission(Node):
         if self._charge_anchor is None:
             self._charge_anchor = (px, py)
             self.get_logger().info(
-                f"[RAMP_CHARGE] commit → charge {dist_target:.2f}m @{speed:.0f} "
-                f"(done if area≥{c['approach_done_area']} or bear<{b['blocking_depth_threshold_m']}m)"
+                f"[RAMP_CHARGE] commit → unconditional charge {dist_target:.2f}m @{speed:.0f}"
             )
         ax, ay = self._charge_anchor
         travelled = math.hypot(px - ax, py - ay)
@@ -1376,25 +1384,10 @@ class ScriptedFinalMission(Node):
         ramp_seen = self.yolo.ramp_visible()
         area = self.yolo.ramp_area_ratio() if ramp_seen else 0.0
 
-        if ramp_seen and area >= c["approach_done_area"]:
-            self.get_logger().info(
-                f"[RAMP_CHARGE] area={area:.3f} ≥ {c['approach_done_area']} "
-                f"travelled={travelled:.2f}m → {next_state.name}"
-            )
-            self.car.stop()
-            self._approach_done = True
-            self._goto(next_state)
-            return
-
-        if self.yolo.bear_visible() and 0 < self.yolo.bear_distance() < b["blocking_depth_threshold_m"]:
-            self.get_logger().info(
-                f"[RAMP_CHARGE] bear at {self.yolo.bear_distance():.2f}m "
-                f"(travelled={travelled:.2f}m) → classify"
-            )
-            self.car.stop()
-            self._goto(S.RAMP_BEAR_CLASSIFY)
-            return
-
+        # 2026-06-14 (Mr.Kung): unconditional charge from the ramp foot. The area≥done
+        # and close-bear checks both ended the charge at travelled≈0 (mask fills the
+        # view / a far bear reads close), so the car backed up without ever climbing.
+        # Only the pose-measured charge_distance_m ends the charge now.
         if travelled >= dist_target:
             self.get_logger().info(
                 f"[RAMP_CHARGE] charged {travelled:.2f}m ≥ {dist_target:.2f}m → {next_state.name}"
@@ -2417,9 +2410,73 @@ class ScriptedFinalMission(Node):
         )
         self._phase_goto(5 if restore_probe else 0)
 
+    def _ramp_grasp_entry_backup(self, b) -> bool:
+        """One-time backup on GRASP_RAMP_BEAR entry. Returns True while this tick is
+        owned by the backup (caller must return), False once the backup is done or
+        skipped so the normal servo can run. One-shot per state entry (see _goto)."""
+        if self._ramp_grasp_backup_done:
+            return False
+
+        trig = b.get("ramp_grasp_backup_trigger_m", 1.0)
+        back_m = b.get("ramp_grasp_backup_distance_m", 0.30)
+        speed = b.get("ramp_grasp_backup_speed", self.cfg["control"]["slow_speed"])
+        settle_s = b.get("ramp_grasp_backup_settle_s", 0.4)
+        decide_s = b.get("ramp_grasp_backup_decide_s", 1.5)
+        timeout_s = b.get("ramp_grasp_backup_timeout_s", 2.0)
+
+        if self._ramp_grasp_backup_t0 is None:
+            self._ramp_grasp_backup_t0 = time.monotonic()
+        waited = time.monotonic() - self._ramp_grasp_backup_t0
+
+        # Phase A: decide. Stop, let the camera/YOLO catch up, then read bear depth.
+        if self._ramp_grasp_backup_anchor is None:
+            self.car.stop()
+            if waited < settle_s:
+                return True
+            visible = self.yolo.bear_visible() and self.yolo.bear_age_s() is not None
+            d = self.yolo.bear_distance() if visible else None
+            if visible and d is not None and math.isfinite(d) and d > trig:
+                self._ramp_grasp_backup_anchor = self.pose[:2] if self.pose else (0.0, 0.0)
+                self._ramp_grasp_backup_t0 = time.monotonic()  # restart for reverse watchdog
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] entry bear d={d:.2f}m > {trig:.2f}m "
+                    f"→ BACKUP {back_m:.2f}m @{speed:.0f} before servo"
+                )
+                return True
+            if visible or waited > decide_s:
+                why = f"d={d:.2f}m ≤ {trig:.2f}m" if visible else "no fresh bear read"
+                self.get_logger().info(
+                    f"[GRASP_RAMP_BEAR] entry backup skipped ({why}) → servo"
+                )
+                self._ramp_grasp_backup_done = True
+                return False
+            return True  # keep waiting briefly for a first fresh read
+
+        # Phase B: reverse a pose-measured distance (elapsed watchdog as fallback).
+        ax, ay = self._ramp_grasp_backup_anchor
+        travelled = (
+            math.hypot(self.pose[0] - ax, self.pose[1] - ay)
+            if self.pose is not None else 0.0
+        )
+        if travelled >= back_m or waited > timeout_s:
+            self.car.stop()
+            self.get_logger().info(
+                f"[GRASP_RAMP_BEAR] entry backup done {travelled:.2f}/{back_m:.2f}m → servo"
+            )
+            self._ramp_grasp_backup_done = True
+            return False
+        self.car.publish_velocities(-speed, -speed)
+        return True
+
     def _state_grasp_ramp_bear(self, next_state):
         b = self.cfg["bear"]
         elapsed = time.monotonic() - self._phase_t0
+
+        # One-time entry backup: the charge can stop with the bear too far ahead;
+        # reverse once before the careful servo if the first read exceeds the
+        # trigger. No-op once fired / when close enough (see _ramp_grasp_entry_backup).
+        if self._ramp_grasp_entry_backup(b):
+            return
 
         if self._phase == 0:       # servo to the ramp bear
             group, interrupted = self._grasp_ramp_target_group_or_interrupt()
