@@ -48,7 +48,7 @@ route:
   # to the short chain; exhausting both fails. yaw is radians (from the measured
   # quaternion; yaw_deg kept in the comment for reference).
   long_side_observe:   # car faces ≈ -x, scanning the ramp from the long side
-    - x: 3.2
+    - x: 3
       y: 2.4
       yaw: -3.14    # yaw_deg -173.50
       tolerance: 0.25
