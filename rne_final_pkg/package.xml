@@ -3,7 +3,7 @@
   <name>rne_final_pkg</name>
   <version>0.0.1</version>
   <description>RNE Final Project Mission Controller</description>
-  <maintainer email="you@example.com">you</maintainer>
+  <maintainer email="kunghsiangyu@gapp.nthu.edu.tw">Hsiang-Yu Kung</maintainer>
   <license>MIT</license>
 
   <exec_depend>rclpy</exec_depend>
