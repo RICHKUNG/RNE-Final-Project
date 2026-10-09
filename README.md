@@ -9,12 +9,33 @@ A ROS 2 package that drives a four-wheel rover with a 5-DOF arm through a random
 
 Final project for **Robotic Navigation and Exploration** at National Tsing Hua University (Spring 2026). Package author: Hsiang-Yu (Rich) Kung.
 
+<p align="center">
+  <img src="docs/media/perception_demo.gif" alt="Left: top-down view of the rover in the Unity course with LiDAR rays. Right: onboard camera with YOLO boxes labelled bear or knob and their depth" width="760">
+  <br><sub>Left: the Unity course from above. Right: the rover's camera with my detector running (bear / knob, with depth). Recorded while driving manually to validate perception, sped up 4×.</sub>
+</p>
+
 ## Highlights
 
 - **Three mission controllers, one package.** A Nav2-based 3-task mission, a looping multi-bear retrieval node, and a **Nav2-free scripted mission** that routes purely on the `map → base_footprint` TF pose.
 - **Pixel → map localization.** YOLO detections are backprojected through the depth camera intrinsics and TF into the map frame, then the last metre is closed with a pixel-offset visual servo.
-- **Custom detector.** Trained on a self-collected 189-image dataset labelled in Roboflow; ramp found with a YOLO11n segmentation model.
+- **Custom perception.** Detector and segmenter trained on 189 images I collected from the rover's camera and labelled in Roboflow (detection test mAP50 0.95).
 - **Failure handling, not just the happy path.** Four-tier stuck recovery, depth-based grasp verification with bounded retries, and a blocking-bear classifier that clears an obstacle bear before attempting the ramp.
+
+## Perception
+
+<p align="center">
+  <img src="docs/media/perception.jpg" alt="Three camera frames: a bear detected at 0.52 m, a door knob detected at 0.58 m, and the bridge segmented in pink" width="900">
+</p>
+
+The mission nodes run on perception models I trained:
+
+| Model | Classes | Training data | Test result |
+|-------|---------|---------------|-------------|
+| YOLO11s detection | `bear`, `knob` | 189 images (130 / 39 / 20 split) | mAP50 0.947, mAP50-95 0.619 |
+| YOLO11m-seg segmentation | `road`, `bridge` | 189 images (132 / 38 / 19 split) | mask mAP50 0.869 |
+| YOLO11n-seg (`ramp_yolo11n.pt`) | `ramp` | trained later for the ramp search in the scripted mission | not recorded |
+
+Images came from the rover's own camera in the final-project scene, collected at different distances, angles and occlusion levels, including empty frames as hard negatives. Each detection is paired with the depth at its centre, which is what `get_bear` backprojects into the map frame.
 
 ## System overview
 
